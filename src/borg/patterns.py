@@ -6,6 +6,7 @@ import sys
 import unicodedata
 from collections import namedtuple
 from enum import Enum
+from time import time_ns
 
 from .helpers import clean_lines, shellpattern
 from .helpers.errors import Error
@@ -98,6 +99,12 @@ class PatternMatcher:
         # TODO: move this info to parse_inclexcl_command and store in PatternBase subclass?
         self.is_include_cmd = {IECommand.Exclude: False, IECommand.ExcludeNoRecurse: False, IECommand.Include: True}
 
+        self.total_match_time_ns = 0
+
+        self.normalize_path_time_ns = 0
+        self.fast_match_time_ns = 0
+        self.slow_match_time_ns = 0
+
     def empty(self):
         return not len(self._items) and not len(self._path_full_patterns)
 
@@ -142,21 +149,33 @@ class PatternMatcher:
         in self.fallback is returned (defaults to None).
 
         """
+        t0 = time_ns()
         path = normalize_path(path).lstrip(os.path.sep)
+
+        self.normalize_path_time_ns += time_ns() - t0
+        t0 = time_ns()
+
         # do a fast lookup for full path matches (note: we do not count such matches):
         non_existent = object()
         value = self._path_full_patterns.get(path, non_existent)
 
         if value is not non_existent:
             # we have a full path match!
+            self.fast_match_time_ns += time_ns() - t0
             self.recurse_dir = command_recurses_dir(value)
             return self.is_include_cmd[value]
+
+        self.fast_match_time_ns += time_ns() - t0
+        t0 = time_ns()
 
         # this is the slow way, if we have many patterns in self._items:
         for pattern, cmd in self._items:
             if pattern.match(path, normalize=False):
+                self.slow_match_time_ns += time_ns() - t0
                 self.recurse_dir = pattern.recurse_dir
                 return self.is_include_cmd[cmd]
+
+        self.slow_match_time_ns += time_ns() - t0
 
         # by default we will recurse if there is no match
         self.recurse_dir = self.recurse_dir_default
@@ -177,7 +196,9 @@ class PatternBase:
 
     def __init__(self, pattern, recurse_dir=False):
         self.pattern_orig = pattern
+        self.check_count = 0
         self.match_count = 0
+        self.match_time_ns = 0
         pattern = normalize_path(pattern)
         self._prepare(pattern)
         self.recurse_dir = recurse_dir
@@ -188,11 +209,14 @@ class PatternBase:
         If normalize is True (default), the path will get normalized using normalize_path(),
         otherwise it is assumed that it already is normalized using that function.
         """
+        t0 = time_ns()
         if normalize:
             path = normalize_path(path)
         matches = self._match(path)
+        self.match_time_ns += time_ns() - t0
         if matches:
             self.match_count += 1
+        self.check_count += 1
         return matches
 
     def __repr__(self):
