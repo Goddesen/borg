@@ -1,6 +1,7 @@
 import argparse
 import fnmatch
 import os.path
+from os.path import sep
 import re
 import sys
 import unicodedata
@@ -98,6 +99,9 @@ class PatternMatcher:
         # TODO: move this info to parse_inclexcl_command and store in PatternBase subclass?
         self.is_include_cmd = {IECommand.Exclude: False, IECommand.ExcludeNoRecurse: False, IECommand.Include: True}
 
+        # At least one pattern requires path to be wrapped in separators
+        self.patterns_require_wrapped_path = False
+
     def empty(self):
         return not len(self._items) and not len(self._path_full_patterns)
 
@@ -108,6 +112,7 @@ class PatternMatcher:
             self._path_full_patterns[key] = cmd
         else:
             self._items.append((pattern, cmd))
+            self.patterns_require_wrapped_path |= pattern.pattern_requires_wrapped_path
 
     def add(self, patterns, cmd):
         """Add list of patterns to internal list. *cmd* indicates whether the
@@ -142,7 +147,8 @@ class PatternMatcher:
         in self.fallback is returned (defaults to None).
 
         """
-        path = normalize_path(path).lstrip(os.path.sep)
+        path = normalize_path(path).lstrip(sep)
+
         # do a fast lookup for full path matches (note: we do not count such matches):
         non_existent = object()
         value = self._path_full_patterns.get(path, non_existent)
@@ -153,8 +159,12 @@ class PatternMatcher:
             return self.is_include_cmd[value]
 
         # this is the slow way, if we have many patterns in self._items:
+        wrapped_path = ""
+        if self.patterns_require_wrapped_path:
+            wrapped_path = f"{path}{sep}"
+
         for pattern, cmd in self._items:
-            if pattern.match(path, normalize=False):
+            if pattern.match(path, wrapped_path, normalize=False):
                 self.recurse_dir = pattern.recurse_dir
                 return self.is_include_cmd[cmd]
 
@@ -181,8 +191,9 @@ class PatternBase:
         pattern = normalize_path(pattern)
         self._prepare(pattern)
         self.recurse_dir = recurse_dir
+        self.pattern_requires_wrapped_path = False
 
-    def match(self, path, normalize=True):
+    def match(self, path, wrapped_path, normalize=True):
         """Return a boolean indicating whether *path* is matched by this pattern.
 
         If normalize is True (default), the path will get normalized using normalize_path(),
@@ -190,7 +201,8 @@ class PatternBase:
         """
         if normalize:
             path = normalize_path(path)
-        matches = self._match(path)
+            wrapped_path = normalize_path(wrapped_path)
+        matches = self._match(path, wrapped_path)
         if matches:
             self.match_count += 1
         return matches
@@ -205,7 +217,7 @@ class PatternBase:
         "Should set the value of self.pattern"
         raise NotImplementedError
 
-    def _match(self, path):
+    def _match(self, path, wrapped_path):
         raise NotImplementedError
 
 
@@ -215,9 +227,9 @@ class PathFullPattern(PatternBase):
     PREFIX = "pf"
 
     def _prepare(self, pattern):
-        self.pattern = os.path.normpath(pattern).lstrip(os.path.sep)  # sep at beginning is removed
+        self.pattern = os.path.normpath(pattern).lstrip(sep)
 
-    def _match(self, path):
+    def _match(self, path, wrapped_path):
         return path == self.pattern
 
 
@@ -235,62 +247,63 @@ class PathPrefixPattern(PatternBase):
 
     PREFIX = "pp"
 
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.pattern_requires_wrapped_path = True
+
     def _prepare(self, pattern):
-        sep = os.path.sep
+        # sep at beginning is removed, even if it was the only character
+        self.pattern = (os.path.normpath(pattern).strip(sep) + sep).lstrip(sep)
 
-        self.pattern = (os.path.normpath(pattern).rstrip(sep) + sep).lstrip(sep)  # sep at beginning is removed
-
-    def _match(self, path):
-        return (path + os.path.sep).startswith(self.pattern)
+    def _match(self, _path, wrapped_path):
+        return wrapped_path.startswith(self.pattern)
 
 
 class FnmatchPattern(PatternBase):
-    """Shell glob patterns to exclude.  A trailing slash means to
-    exclude the contents of a directory, but not the directory itself.
+    """Shell glob patterns to match.  A trailing slash means to
+    match the contents of a directory, but not the directory itself.
     """
 
     PREFIX = "fm"
 
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.pattern_requires_wrapped_path = True
+
     def _prepare(self, pattern):
-        if pattern.endswith(os.path.sep):
-            pattern = os.path.normpath(pattern).rstrip(os.path.sep) + os.path.sep + "*" + os.path.sep
-        else:
-            pattern = os.path.normpath(pattern) + os.path.sep + "*"
+        self.pattern = f"{os.path.normpath(pattern).strip(sep)}{sep}*"
+        if pattern.endswith(sep):
+            self.pattern += f"{sep}*"
 
-        self.pattern = pattern.lstrip(os.path.sep)  # sep at beginning is removed
-
-        # fnmatch and re.match both cache compiled regular expressions.
-        # Nevertheless, this is about 10 times faster.
         self.regex = re.compile(fnmatch.translate(self.pattern))
 
-    def _match(self, path):
-        return self.regex.match(path + os.path.sep) is not None
+    def _match(self, path, wrapped_path):
+        return self.regex.match(wrapped_path) is not None
 
 
 class ShellPattern(PatternBase):
-    """Shell glob patterns to exclude.  A trailing slash means to
-    exclude the contents of a directory, but not the directory itself.
+    """Shell glob patterns to match.  A trailing slash means to
+    match the contents of a directory, but not the directory itself.
     """
 
     PREFIX = "sh"
 
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.pattern_requires_wrapped_path = True
+
     def _prepare(self, pattern):
-        sep = os.path.sep
-
+        self.pattern = f"{os.path.normpath(pattern).strip(sep)}{sep}**{sep}"
         if pattern.endswith(sep):
-            pattern = os.path.normpath(pattern).rstrip(sep) + sep + "**" + sep + "*" + sep
-        else:
-            pattern = os.path.normpath(pattern) + sep + "**" + sep + "*"
+            self.pattern += f"*{sep}*"
+        self.regex = re.compile(shellpattern.translate(self.pattern, match_start="", match_end=r"\Z"))
 
-        self.pattern = pattern.lstrip(sep)  # sep at beginning is removed
-        self.regex = re.compile(shellpattern.translate(self.pattern))
-
-    def _match(self, path):
-        return self.regex.match(path + os.path.sep) is not None
+    def _match(self, path, wrapped_path):
+        return self.regex.match(wrapped_path) is not None
 
 
 class RegexPattern(PatternBase):
-    """Regular expression to exclude."""
+    """Regular expression to match."""
 
     PREFIX = "re"
 
@@ -298,10 +311,10 @@ class RegexPattern(PatternBase):
         self.pattern = pattern  # sep at beginning is NOT removed
         self.regex = re.compile(pattern)
 
-    def _match(self, path):
+    def _match(self, path, wrapped_path):
         # Normalize path separators
-        if os.path.sep != "/":
-            path = path.replace(os.path.sep, "/")
+        if sep != "/":
+            path = path.replace(sep, "/")
 
         return self.regex.search(path) is not None
 

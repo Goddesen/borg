@@ -1,6 +1,7 @@
 import argparse
 import io
 import os.path
+from os.path import sep
 import sys
 
 import pytest
@@ -11,11 +12,15 @@ from ..patterns import parse_pattern, PatternMatcher
 from ..patterns import get_regex_from_pattern
 
 
+def check_pattern(file, pattern):
+    return pattern.match(file, f"{file}{sep}")
+
+
 def check_patterns(files, pattern, expected):
     """Utility for testing patterns."""
     assert all([f == os.path.normpath(f) for f in files]), "Pattern matchers expect normalized input paths"
 
-    matched = [f for f in files if pattern.match(f)]
+    matched = [f for f in files if check_pattern(f, pattern)]
 
     assert matched == (files if expected is None else expected)
 
@@ -316,9 +321,9 @@ def test_patterns_regex(pattern, expected):
 
 def test_regex_pattern():
     # The forward slash must match the platform-specific path separator
-    assert RegexPattern("^/$").match("/")
-    assert RegexPattern("^/$").match(os.path.sep)
-    assert not RegexPattern(r"^\\$").match("/")
+    assert check_pattern("/", RegexPattern("^/$"))
+    assert check_pattern(sep, RegexPattern("^/$"))
+    assert not check_pattern("/", RegexPattern(r"^\\$"))
 
 
 def use_normalized_unicode():
@@ -336,20 +341,20 @@ def _make_test_patterns(pattern):
 
 @pytest.mark.parametrize("pattern", _make_test_patterns("b\N{LATIN SMALL LETTER A WITH ACUTE}"))
 def test_composed_unicode_pattern(pattern):
-    assert pattern.match("b\N{LATIN SMALL LETTER A WITH ACUTE}/foo")
-    assert pattern.match("ba\N{COMBINING ACUTE ACCENT}/foo") == use_normalized_unicode()
+    assert check_pattern("b\N{LATIN SMALL LETTER A WITH ACUTE}/foo", pattern)
+    assert check_pattern("ba\N{COMBINING ACUTE ACCENT}/foo", pattern) == use_normalized_unicode()
 
 
 @pytest.mark.parametrize("pattern", _make_test_patterns("ba\N{COMBINING ACUTE ACCENT}"))
 def test_decomposed_unicode_pattern(pattern):
-    assert pattern.match("b\N{LATIN SMALL LETTER A WITH ACUTE}/foo") == use_normalized_unicode()
-    assert pattern.match("ba\N{COMBINING ACUTE ACCENT}/foo")
+    assert check_pattern("b\N{LATIN SMALL LETTER A WITH ACUTE}/foo", pattern) == use_normalized_unicode()
+    assert check_pattern("ba\N{COMBINING ACUTE ACCENT}/foo", pattern)
 
 
 @pytest.mark.parametrize("pattern", _make_test_patterns(str(b"ba\x80", "latin1")))
 def test_invalid_unicode_pattern(pattern):
-    assert not pattern.match("ba/foo")
-    assert pattern.match(str(b"ba\x80/foo", "latin1"))
+    assert not check_pattern("ba/foo", pattern)
+    assert check_pattern(str(b"ba\x80/foo", "latin1"), pattern)
 
 
 @pytest.mark.parametrize(
