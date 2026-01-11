@@ -44,8 +44,11 @@ class CreateMixIn:
     def do_create(self, args, repository, manifest):
         """Creates a new archive."""
         key = manifest.key
+
+        matcher_setup_t0 = time.time_ns()
         matcher = PatternMatcher(fallback=True)
         matcher.add_inclexcl(args.patterns)
+        matcher_setup_time = time.time_ns() - matcher_setup_t0
 
         def create_inner(archive, cache, fso):
             # Add cache dir to inode_skip list
@@ -267,6 +270,18 @@ class CreateMixIn:
                 create_inner(archive, cache, fso)
         else:
             create_inner(None, None, None)
+
+        cmd_repr = {1: "/", 2: "%", 3: "+", 4: "-", 5: "!"}
+        print("Matchers:")
+        for s in (
+            f"{pattern.match_count} ({pattern.check_count}) {round(pattern.match_time_ns / 1000000, 2)}ms | {cmd_repr[cmd.value]} {pattern.PREFIX} {pattern.pattern_orig} -> {pattern.regex.pattern if pattern.regex is not None else pattern.pattern}"
+            for pattern, cmd in matcher._items
+        ):
+            print(s)
+        print(f"Total normalize path time: {round(matcher.normalize_path_time_ns / 1000000, 2)}ms")
+        print(f"Total fast match time: {round(matcher.fast_match_time_ns / 1000000, 2)}ms")
+        print(f"Total slow match time: {round(matcher.slow_match_time_ns / 1000000, 2)}ms")
+        print(f"Matcher setup time: {round(matcher_setup_time / 1000000, 2)}ms")
 
     def _process_any(self, *, path, parent_fd, name, st, fso, cache, read_special, dry_run, strip_prefix):
         """
