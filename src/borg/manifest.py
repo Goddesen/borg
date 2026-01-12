@@ -194,8 +194,7 @@ class Archives:
                     archive_infos = [x for x in archive_infos if x.host == wanted_host]
                 else:  #  do a match on the name
                     match = match.removeprefix("name:")  # accept optional name: prefix
-                    regex = get_regex_from_pattern(match)
-                    regex = re.compile(regex + match_end)
+                    regex = get_regex_from_pattern(match, match_end=match_end)
                     archive_infos = [x for x in archive_infos if regex.match(x.name) is not None]
         return archive_infos
 

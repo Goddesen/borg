@@ -13,7 +13,7 @@ from ..patterns import get_regex_from_pattern
 
 
 def check_pattern(file, pattern):
-    return pattern.match(file, f"{file}{sep}")
+    return pattern.match(f"{sep}{file}{sep}", file)
 
 
 def check_patterns(files, pattern, expected):
@@ -247,7 +247,7 @@ def test_patterns_fnmatch(pattern, expected):
         ("/srv*/", ["srv/messages", "srv/dmesg", "srv2/blafasel"]),
         ("/srv*", ["srv", "srv/messages", "srv/dmesg", "srv2", "srv2/blafasel"]),
         ("/srv/*", ["srv/messages", "srv/dmesg"]),
-        ("/srv2/**", ["srv2", "srv2/blafasel"]),
+        ("/srv2/**", ["srv2/blafasel"]),
         ("/srv2/**/", ["srv2/blafasel"]),
         ("/home/*/.thumbnails", ["home/foo/.thumbnails"]),
         ("/home/*/*/.thumbnails", ["home/foo/bar/.thumbnails"]),
@@ -641,4 +641,4 @@ def test_pattern_matcher():
     ],
 )
 def test_regex_from_pattern(pattern, regex):
-    assert get_regex_from_pattern(pattern) == regex
+    assert get_regex_from_pattern(pattern).pattern == regex

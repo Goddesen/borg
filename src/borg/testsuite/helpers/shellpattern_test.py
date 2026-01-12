@@ -6,7 +6,11 @@ from ...helpers import shellpattern
 
 
 def check(path, pattern):
-    compiled = re.compile(shellpattern.translate(pattern))
+    compiled = shellpattern.compile(pattern)
+
+    print(f"Pattern: {pattern}")
+    print(f"Compiled: {compiled.pattern}")
+    print(f"Path: {path}")
 
     return bool(compiled.match(path))
 
@@ -122,11 +126,11 @@ def test_mismatch(path, patterns):
 
 
 def test_match_end():
-    regex = shellpattern.translate("*-home")  # The default is match_end == end of string.
-    assert re.match(regex, "2017-07-03-home")
-    assert not re.match(regex, "2017-07-03-home.xxx")
+    regex = shellpattern.compile("*-home")  # The default is match_end == end of string.
+    assert regex.match("2017-07-03-home")
+    assert not regex.match("2017-07-03-home.xxx")
 
     match_end = r"(\.xxx)?\Z"  # With or without a .xxx suffix.
-    regex = shellpattern.translate("*-home", match_end=match_end)
-    assert re.match(regex, "2017-07-03-home")
-    assert re.match(regex, "2017-07-03-home.xxx")
+    regex = shellpattern.compile("*-home", match_end=match_end)
+    assert regex.match("2017-07-03-home")
+    assert regex.match("2017-07-03-home.xxx")

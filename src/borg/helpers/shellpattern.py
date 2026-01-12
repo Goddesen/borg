@@ -3,7 +3,7 @@ import re
 from queue import LifoQueue
 
 
-def translate(pat, match_start="", match_end=r"\Z", flags="ms"):
+def compile(pat, match_start="", match_end=r"\Z", flags=re.DOTALL | re.MULTILINE):
     """Translate a shell-style pattern to a regular expression.
 
     The pattern may include ``**<sep>`` (<sep> stands for the platform-specific path separator; "/" on POSIX systems)
@@ -65,7 +65,7 @@ def translate(pat, match_start="", match_end=r"\Z", flags="ms"):
         else:
             res += re.escape(c)
 
-    return f"(?{flags}){match_start}{res}{match_end}"
+    return re.compile(f"{match_start}{res}{match_end}", flags)
 
 
 def _parse_braces(pat):
