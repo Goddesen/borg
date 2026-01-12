@@ -264,16 +264,24 @@ class FnmatchPattern(PatternBase):
     """
 
     PREFIX = "fm"
+    DEFAULT_MATCH_START = rf"\A{sep}"
 
     def _prepare(self, pattern):
-        self.pattern = f"{sep}{normpath(pattern).strip(sep)}{sep}*"
+        match_start = self.DEFAULT_MATCH_START
+
+        self.pattern = normpath(pattern).strip(sep)
+
+        if re.match(rf"\*{sep}(?!\*)", self.pattern):
+            self.pattern = self.pattern.removeprefix(rf"*{sep}")
+            match_start = sep
+
         if pattern.endswith(sep):
             self.pattern += f"{sep}*"
 
-        self.regex = re.compile(fnmatch.translate(self.pattern))
+        self.regex = re.compile(match_start + fnmatch.translate(self.pattern).rstrip(r"\Z") + sep)
 
     def _match(self, path, _unwrapped_path):
-        return self.regex.match(path) is not None
+        return self.regex.search(path) is not None
 
 
 class ShellPattern(PatternBase):
