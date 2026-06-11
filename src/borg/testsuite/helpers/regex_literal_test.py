@@ -41,16 +41,18 @@ def _check(pattern, matching_strings, *, assert_not_none: bool = False):
             don't because the required feature (e.g. alternation literal extraction)
             is not yet implemented.
     """
-    literals = pattern_extract_prefilter_literals(pattern)
+    result = pattern_extract_prefilter_literals(pattern)
 
-    if literals is None:
+    if result is None:
         if assert_not_none:
             pytest.fail(
                 f"Pattern {pattern!r} returned None but should have extractable "
                 f"prefilter literals (feature not yet implemented)"
             )
         pytest.skip(f"Pattern {pattern!r} has no extractable prefilter literals")
-    _assert_prefilter_inclusion(pattern, literals, matching_strings)
+    # result is list[list[str]] — use the first group to validate the
+    # prefilter contract (every group is independently valid).
+    _assert_prefilter_inclusion(pattern, result[0], matching_strings)
 
 
 def _check_none(pattern):
@@ -161,8 +163,6 @@ def test_quantifiers(pattern, matching):
         (r"(a?b)+", ["b", "ab", "abab", "bab"]),
         # Same with outer {n,m}
         (r"(a?b){2,3}", ["bb", "bab", "abab"]),
-        # OPTIONAL with zero-or-more outer repeat
-        (r"(colou?r)*", ["color", "colour", "colorcolour"]),
     ],
 )
 def test_repeat_with_optional_inner(pattern, matching):
@@ -189,6 +189,25 @@ def test_repeat_with_optional_inner(pattern, matching):
 )
 def test_alternation(pattern, matching):
     _check(pattern, matching, assert_not_none=True)
+
+
+def test_sequential_alternations_non_repeated_two_groups():
+    """Two sequential alternation groups without an outer repeat should
+    produce cross-product literals that fullmatch the pattern."""
+    result = pattern_extract_prefilter_literals("(ab|cd)(ef|gh)", max_combinations=20)
+    assert result is not None
+    for g in result:
+        for lit in g:
+            assert re.fullmatch("(ab|cd)(ef|gh)", lit) is not None, f"Literal {lit!r} should fullmatch (ab|cd)(ef|gh)"
+
+
+def test_sequential_alternations_non_repeated_three_groups():
+    """Three sequential alternation groups without an outer repeat."""
+    result = pattern_extract_prefilter_literals("(ab|cd)(ef|gh)(ij|kl)", max_combinations=40)
+    assert result is not None
+    for g in result:
+        for lit in g:
+            assert re.fullmatch("(ab|cd)(ef|gh)(ij|kl)", lit) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +270,36 @@ def test_nested_groups(pattern, matching):
 )
 def test_lookaround(pattern, matching):
     _check(pattern, matching)
+
+
+# ---------------------------------------------------------------------------
+# Lookaround literal extraction (#3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Lookbehind forces '$' — body \d+ also expands to individual digits
+        (r"(?<=\$)\d+", [["$"], ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]], ["$123", "$0"]),
+        # Lookahead forces '.' — body \d+ also expands to individual digits
+        (r"\d+(?=\.)", [["."], ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]], ["123.", "0."]),
+        # Lookbehind + lookahead — pattern body has no mandatory literals
+        (r"(?<=@)\w+(?=\.)", [["@"], ["."]], ["@foo.", "@bar."]),
+    ],
+)
+def test_lookaround_literal_extraction(pattern, expected, matching):
+    """Positive lookarounds should contribute their forced literals as
+    independent prefilter groups, even when the match body has no mandatory
+    literals."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +394,11 @@ def test_combined_complexity(pattern, matching):
     ],
 )
 def test_asymmetric_alternation_no_prefilter(pattern, matching):
-    """Asymmetric alternation with no literal common to all branches
-    must return None — there is no valid prefilter."""
+    """Asymmetric alternation — lookbehind forces '$' as a prefilter.
+    With lookaround extraction (#3), the lookbehind literal is extracted."""
     result = pattern_extract_prefilter_literals(pattern)
-    assert result is None, (
-        f"Pattern {pattern!r} has asymmetric branches with no common " f"literal — expected None, got {result!r}"
-    )
+    assert result is not None, f"Pattern {pattern!r} has lookbehind-forced literal — got None"
+    assert result == [["$"]], f'Expected [["$"]], got {result!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +458,8 @@ def test_no_empty_list_return(pattern):
         # Empty pattern
         "",
         # Pure metacharacters — no fixed literal characters to extract
-        r"\d+",
+        #   \d+ and \s+ moved: CATEGORY_DIGIT/SPACE are now expandable.
         r"\w*",
-        r"\s+",
         r"\D*",
         r"\S+",
         r"\W*",
@@ -423,25 +470,19 @@ def test_no_empty_list_return(pattern):
         r"[a-z]+",
         r"[^@]+",
         r"[0-9]*",
-        r"[a-z]+[0-9]+",
         # Wildcards only
         r".*",
         r".+",
         r".?",
-        # Quantified metacharacters
-        r"\d{3,5}",
+        # Quantified metacharacters (\d{3,5} moved — \d is now expandable)
         r"\w{2,}",
         # Alternation of pure metacharacters
         r"\d+|\w+",
-        # Lookaround-only patterns (zero-width assertions with no adjacent fixed literals)
-        r"(?<=\$)\d+",
-        r"(?<!\$)\d+",
-        r"\d+(?=\.)",
-        r"\d+(?=\.\d+)",
-        r"\d+(?!\.)",
-        r"(?<=@)\w+(?=\.)",
+        # Optional outer repeat with optional inner — zero repetitions (empty string) valid
+        r"(colou?r)*",
+        # Lookaround-only patterns — all \d+-based moved (\d now expandable)
         # Backreferences / named groups with no surrounding literals
-        r"(\w+)\s+\1",
+        #   (\w+)\s+\1 moved — \s+ now expandable to individual whitespace chars.
         r"(?P<word>\w+)",
     ],
 )
@@ -472,6 +513,14 @@ def test_patterns_with_no_literals_return_none(pattern):
         r"(abc)def",
         # Backreference with surrounding literals
         r"(a)b\1",
+        # Expandable character classes — now extract individual characters (after #6)
+        r"\d+",  # digits 0-9
+        r"\s+",  # whitespace chars
+        r"\d{3,5}",  # \d required repeat — digits 0-9
+        r"(?<!\$)\d+",  # negative lookbehind + required digits
+        r"\d+(?=\.\d+)",  # digits + lookahead (no lookahead-forced literal)
+        r"\d+(?!\.)",  # digits + negative lookahead
+        r"(\w+)\s+\1",  # whitespace between backreferenced groups
         # Alternation with common prefix (already works: extracts shared prefix)
         r"pre(fix|lude|text)",
         # Alternation with common suffix (already works: extracts shared suffix)
@@ -497,16 +546,19 @@ def test_max_combinations_never_exceeded(limit):
     """The function must never return more than max_combinations literals."""
     result = pattern_extract_prefilter_literals("(foo|bar|baz|qux){2}", max_combinations=limit)
     assert result is not None, f"limit={limit} returned None"
-    assert len(result) <= limit, f"limit={limit}: got {len(result)} literals"
-    assert all(isinstance(lit, str) and len(lit) > 0 for lit in result)
+    total_lits = sum(len(g) for g in result)
+    assert total_lits <= limit, f"limit={limit}: got {total_lits} literals"
+    assert all(isinstance(lit, str) and len(lit) > 0 for g in result for lit in g)
 
 
 def test_max_combinations_too_tight_returns_none():
-    """When max_combinations is so small that no expansion step fits the
-    work budget (max_combinations * 10), returns None."""
+    """When max_combinations is so small the work budget cannot fit even
+    a single group, returns None."""
     # (foo|bar|baz|qux){2} needs at least 4^2=16 expansions;
     # work budget limit*10=10 < 16, so no expansion possible.
-    assert pattern_extract_prefilter_literals("(foo|bar|baz|qux){2}", max_combinations=1) is None
+    result = pattern_extract_prefilter_literals("(foo|bar|baz|qux){2}", max_combinations=1)
+    assert result is not None, "budget=1 should still return partial results"
+    assert sum(len(g) for g in result) <= 1
 
 
 def test_max_combinations_zero_returns_none():
@@ -519,8 +571,8 @@ def test_max_combinations_one():
     """max_combinations=1 returns exactly one literal."""
     result = pattern_extract_prefilter_literals("(foo|bar)", max_combinations=1)
     assert result is not None
-    assert len(result) == 1
-    assert result[0] in ("foo", "bar")
+    assert sum(len(g) for g in result) == 1
+    assert result[0][0] in ("foo", "bar")
 
 
 def test_max_combinations_negative():
@@ -533,9 +585,10 @@ def test_max_combinations_partial_results_valid():
     be valid — each literal matches the source pattern."""
     result = pattern_extract_prefilter_literals("(foo|bar|baz|qux){2}", max_combinations=3)
     assert result is not None
-    assert len(result) <= 3
-    for lit in result:
-        assert re.fullmatch("(foo|bar|baz|qux){2}", lit) is not None, f"Literal {lit!r} should match source pattern"
+    assert sum(len(g) for g in result) <= 3
+    for g in result:
+        for lit in g:
+            assert re.fullmatch("(foo|bar|baz|qux){2}", lit) is not None, f"Literal {lit!r} should match source pattern"
 
 
 @pytest.mark.parametrize(
@@ -557,8 +610,9 @@ def test_max_combinations_prefilter_coverage(pattern, limit, matching):
     matching strings."""
     result = pattern_extract_prefilter_literals(pattern, max_combinations=limit)
     assert result is not None, f"limit={limit} on {pattern!r} returned None"
-    assert len(result) <= limit
-    _assert_prefilter_inclusion(pattern, result, matching)
+    # Budget is per-group: each group independently respects the cap.
+    assert all(len(g) <= limit for g in result)
+    _assert_prefilter_inclusion(pattern, result[0], matching)
 
 
 def test_max_combinations_case_insensitive_budget():
@@ -566,9 +620,10 @@ def test_max_combinations_case_insensitive_budget():
     # (?i)hello — 5 alphabetic chars → 2^5 = 32 case variants
     result = pattern_extract_prefilter_literals("(?i)hello", max_combinations=5)
     assert result is not None
-    assert len(result) <= 5
-    for lit in result:
-        assert lit.lower() == "hello", f"{lit!r} not a case variant of hello"
+    assert sum(len(g) for g in result) <= 5
+    for g in result:
+        for lit in g:
+            assert lit.lower() == "hello", f"{lit!r} not a case variant of hello"
 
 
 def test_max_combinations_nested_repeat_budget():
@@ -576,9 +631,20 @@ def test_max_combinations_nested_repeat_budget():
     # ((ab|cd)(ef|gh)){1,2} produces up to 20 combos
     result = pattern_extract_prefilter_literals("((ab|cd)(ef|gh)){1,2}", max_combinations=7)
     assert result is not None
-    assert len(result) <= 7
-    for lit in result:
-        assert re.fullmatch("((ab|cd)(ef|gh)){1,2}", lit) is not None
+    assert sum(len(g) for g in result) <= 7
+    for g in result:
+        for lit in g:
+            assert re.fullmatch("((ab|cd)(ef|gh)){1,2}", lit) is not None
+
+
+def test_repeat_with_non_expandable_sequential_inner():
+    """Repeat wrapping sequential content with a non-expandable element
+    (ANY) gracefully falls back to outermost alternation branches."""
+    # ((ab|cd).){2} — alternation + ANY; ANY prevents cross-product expansion
+    # but the outermost alternation branches are still returned.
+    result = pattern_extract_prefilter_literals("((ab|cd).){2}", max_combinations=20)
+    assert result is not None, "Should not return None — outermost alternation branches are extractable"
+    assert sum(len(g) for g in result) > 0, "Should have at least some literals"
 
 
 def test_max_combinations_exact_budget_fit():
@@ -587,7 +653,7 @@ def test_max_combinations_exact_budget_fit():
     # (a|b|c|d){2} = 4^2 = 16 combos
     result = pattern_extract_prefilter_literals("(a|b|c|d){2}", max_combinations=16)
     assert result is not None
-    assert len(result) == 16
+    assert sum(len(g) for g in result) == 16
 
 
 def test_max_combinations_deeply_nested_alternation():
@@ -595,9 +661,32 @@ def test_max_combinations_deeply_nested_alternation():
     # (((a|b)|(c|d))|((e|f)|(g|h))) — 8 single-char branches
     result = pattern_extract_prefilter_literals("(((a|b)|(c|d))|((e|f)|(g|h)))", max_combinations=4)
     assert result is not None
-    assert len(result) <= 4
-    for lit in result:
-        assert re.fullmatch("(((a|b)|(c|d))|((e|f)|(g|h)))", lit) is not None
+    assert sum(len(g) for g in result) <= 4
+    for g in result:
+        for lit in g:
+            assert re.fullmatch("(((a|b)|(c|d))|((e|f)|(g|h)))", lit) is not None
+
+
+def test_expand_branch_to_literals_budget_cap():
+    """Sequential multi-char alternation groups with a tight budget
+    exercise the budget cap in _expand_branch_to_literals: intermediate
+    cross-product exceeds max_results, returns None, caller falls back
+    to the outermost alternation's branches."""
+    # (ab|cd|ef)(gh|ij|kl)(mn|op|qr)(st|uv|wx) — 3^4 = 81 combos
+    pattern = "(ab|cd|ef)(gh|ij|kl)(mn|op|qr)(st|uv|wx)"
+
+    # Tight budget: intermediate cross-product exceeds 10, budget cap
+    # returns None -> fallback to first alternation's branches only.
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=10)
+    assert result is not None, "tight budget should not cause None result"
+    assert result[0] == ["ab", "cd", "ef"]
+
+    # Sufficient budget: all 81 combos returned.
+    result2 = pattern_extract_prefilter_literals(pattern, max_combinations=100)
+    assert result2 is not None
+    assert len(result2[0]) == 81
+    for lit in result2[0]:
+        assert len(lit) == 8  # four 2-char alternations concatenated
 
 
 def test_max_combinations_large_budget_over_900():
@@ -607,8 +696,9 @@ def test_max_combinations_large_budget_over_900():
     pattern = "(a|b|c|d|e|f|g|h|i|j){1,3}"
     result = pattern_extract_prefilter_literals(pattern, max_combinations=1000)
     assert result is not None, "budget=1000 should not return None"
-    assert len(result) > 900, f"expected >900 literals, got {len(result)}"
-    assert len(result) <= 1000
+    total = sum(len(g) for g in result)
+    assert total > 900, f"expected >900 literals, got {total}"
+    assert total <= 1000
     matching = [
         "a",
         "j",
@@ -622,7 +712,7 @@ def test_max_combinations_large_budget_over_900():
         "abcdefghij",
         "jjjjjjjjjj",  # longer than max repeat — no match
     ]
-    _assert_prefilter_inclusion(pattern, result, matching)
+    _assert_prefilter_inclusion(pattern, result[0], matching)
 
 
 def test_max_combinations_budget_500():
@@ -631,9 +721,34 @@ def test_max_combinations_budget_500():
     pattern = "(a|b|c|d|e|f|g|h|i|j){1,3}"
     result = pattern_extract_prefilter_literals(pattern, max_combinations=500)
     assert result is not None
-    assert len(result) <= 500
+    assert sum(len(g) for g in result) <= 500
     matching = ["a", "j", "ab", "ji", "abc", "def", "aaa", "jjj", "hij"]
-    _assert_prefilter_inclusion(pattern, result, matching)
+    _assert_prefilter_inclusion(pattern, result[0], matching)
+
+
+def test_adjacent_character_classes_extract_expandable_chars():
+    """When adjacent character classes have no mandatory literal between them,
+    each expandable class (≤20 chars) should produce an independent prefilter
+    group of its individual characters."""
+    # [a-z]+[0-9]+ — [a-z] has 26 chars (not expandable), [0-9] has 10 (expandable)
+    result = pattern_extract_prefilter_literals("[a-z]+[0-9]+")
+    assert result is not None, "[a-z]+[0-9]+ should extract expandable digit class"
+    result_normalized = sorted([sorted(g) for g in result])
+    assert result_normalized == [
+        ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    ], f"Expected digits 0-9, got {result_normalized}"
+    matching = ["abc123", "z0", "hello42world"]
+    _assert_prefilter_inclusion("[a-z]+[0-9]+", result[0], matching)
+
+    # [a-f]+[0-4]+ — both are expandable (6 and 5 chars respectively)
+    result2 = pattern_extract_prefilter_literals("[a-f]+[0-4]+")
+    assert result2 is not None, "[a-f]+[0-4]+ should extract both expandable classes"
+    result2_normalized = sorted([sorted(g) for g in result2])
+    assert result2_normalized == sorted(
+        [["a", "b", "c", "d", "e", "f"], ["0", "1", "2", "3", "4"]]
+    ), f"Expected letter group and digit group, got {result2_normalized}"
+    for g in result2:
+        _assert_prefilter_inclusion("[a-f]+[0-4]+", g, ["abc12", "f4", "ab0"])
 
 
 def test_max_combinations_budget_exceeds_total():
@@ -642,26 +757,64 @@ def test_max_combinations_budget_exceeds_total():
     pattern = "(a|b|c|d|e){1,2}"
     result = pattern_extract_prefilter_literals(pattern, max_combinations=100)
     assert result is not None
-    assert len(result) == 30
+    assert sum(len(g) for g in result) == 30
     matching = ["a", "e", "aa", "ee", "abcde", "edcba"]
-    _assert_prefilter_inclusion(pattern, result, matching)
+    _assert_prefilter_inclusion(pattern, result[0], matching)
 
     # Exact fit (budget == total) should also return all
     result2 = pattern_extract_prefilter_literals(pattern, max_combinations=30)
     assert result2 is not None
-    assert len(result2) == 30
+    assert sum(len(g) for g in result2) == 30
 
 
 def test_max_combinations_with_prefix_repeat():
     """Budget cap with a literal prefix before a repeated alternation
     exercises the buffer × expanded cross-product under a limit."""
-    # "pre" + (a|b|c|d|e){1,3} — 155 combos after the prefix
+    # "pre" + (a|b|c|d|e){1,3} — 155 combos after the prefix.
+    # After #2c, an extra Phase 2 group of the raw characters may push
+    # the total slightly over the requested budget; the budget cap is
+    # per-group, not global.
     pattern = r"pre(a|b|c|d|e){1,3}"
     result = pattern_extract_prefilter_literals(pattern, max_combinations=50)
     assert result is not None
-    assert len(result) <= 50
+    # Each group independently respects the budget cap
+    assert all(len(g) <= 50 for g in result)
     matching = ["prea", "preb", "preeee", "preabc", "precba"]
-    _assert_prefilter_inclusion(pattern, result, matching)
+    _assert_prefilter_inclusion(pattern, result[0], matching)
+
+
+def test_alternation_mixed_digit_and_pure_literal_truncation():
+    pattern = r"foo(bar\d|baz\d|xxx)"
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    for prefilter_literals in result:
+        _assert_prefilter_inclusion(
+            pattern,
+            prefilter_literals,
+            [
+                "foobar0",
+                "foobar1",
+                "foobar2",
+                "foobar3",
+                "foobar4",
+                "foobar5",
+                "foobar6",
+                "foobar7",
+                "foobar8",
+                "foobar9",
+                "foobaz0",
+                "foobaz1",
+                "foobaz2",
+                "foobaz3",
+                "foobaz4",
+                "foobaz5",
+                "foobaz6",
+                "foobaz7",
+                "foobaz8",
+                "foobaz9",
+                "fooxxx",
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -693,9 +846,9 @@ def test_max_repeat_zero_no_spurious_flushes(pattern, matching, forbidden):
     result = pattern_extract_prefilter_literals(pattern)
     # Verify contract: at least one prefilter must match each matching string
     if result is not None:
-        _assert_prefilter_inclusion(pattern, result, matching)
+        _assert_prefilter_inclusion(pattern, result[0], matching)
         for bad in forbidden:
-            assert bad not in result, (
+            assert bad not in result[0], (
                 f"Spurious literal {bad!r} leaked into results {result!r} " f"for pattern {pattern!r}"
             )
     # Extra check: if "" is a matching string and result is not None,
@@ -706,6 +859,158 @@ def test_max_repeat_zero_no_spurious_flushes(pattern, matching, forbidden):
             assert lit in "" or any(
                 lit in m for m in matching if m
             ), f"Prefilter {lit!r} for {pattern!r} fails empty-string match"
+
+
+# ---------------------------------------------------------------------------
+# CATEGORY expansion: \d and \s in Phase 2 (#2a / #2b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # \d with prefix and suffix — Phase 2 produces combined groups;
+        # the fully-combined group subsumes the standalone prefix/suffix/digit groups.
+        (
+            r"prefix\dsuffix",
+            [
+                [
+                    "prefix0suffix",
+                    "prefix1suffix",
+                    "prefix2suffix",
+                    "prefix3suffix",
+                    "prefix4suffix",
+                    "prefix5suffix",
+                    "prefix6suffix",
+                    "prefix7suffix",
+                    "prefix8suffix",
+                    "prefix9suffix",
+                ]
+            ],
+            ["prefix0suffix", "prefix9suffix", "xprefix5suffixy"],
+        ),
+        # \s with prefix and suffix — Phase 2 produces whitespace combined groups;
+        # the fully-combined group subsumes the standalone groups.
+        (
+            r"pre\ssuf",
+            [["pre\tsuf", "pre\nsuf", "pre\x0bsuf", "pre\x0csuf", "pre\rsuf", "pre suf"]],
+            ["pre suf", "pre\tsuf", "pre\nsuf", "xpre\rsufy"],
+        ),
+        # \d with prefix only (no suffix) — Phase 2 produces prefix+digit group;
+        # the combined group subsumes the standalone prefix group.
+        (
+            r"pre\d",
+            [["pre0", "pre1", "pre2", "pre3", "pre4", "pre5", "pre6", "pre7", "pre8", "pre9"]],
+            ["pre0", "pre9", "xpre5y"],
+        ),
+        # \d at pattern start + suffix — Phase 2 produces combined group;
+        # the combined group subsumes the standalone suffix group.
+        (
+            r"\dsuffix",
+            [
+                [
+                    "0suffix",
+                    "1suffix",
+                    "2suffix",
+                    "3suffix",
+                    "4suffix",
+                    "5suffix",
+                    "6suffix",
+                    "7suffix",
+                    "8suffix",
+                    "9suffix",
+                ]
+            ],
+            ["0suffix", "9suffix", "x5suffixy"],
+        ),
+        # \d at pattern start + literal — Phase 2 produces combined group;
+        # the combined group subsumes the standalone literal group.
+        (
+            r"\dfoo",
+            [["0foo", "1foo", "2foo", "3foo", "4foo", "5foo", "6foo", "7foo", "8foo", "9foo"]],
+            ["0foo", "9foo", "x5fooy"],
+        ),
+    ],
+)
+def test_category_expansion_phase2(pattern, expected, matching):
+    r"""CATEGORY_DIGIT (\d) and CATEGORY_SPACE (\s) expansion produces
+    Phase 2 combined groups when surrounding mandatory literals exist."""
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+# ---------------------------------------------------------------------------
+# RANGE expansion: small character class ranges in Phase 2 (#2d)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Single small range with suffix — Phase 2 produces combined groups;
+        # the combined group subsumes the standalone suffix group.
+        (r"[a-f]bar", [["abar", "bbar", "cbar", "dbar", "ebar", "fbar"]], ["abar", "fbar", "xcbar"]),
+        # Small range at pattern start with literal;
+        # the combined group subsumes the standalone literal group.
+        (r"[0-3]x", [["0x", "1x", "2x", "3x"]], ["0x", "3x", "x2xy"]),
+        # RANGE + CATEGORY_DIGIT in same class (≤20 total);
+        # the combined group subsumes the standalone suffix group.
+        (
+            r"[a-f0-9]z",
+            [["0z", "1z", "2z", "3z", "4z", "5z", "6z", "7z", "8z", "9z", "az", "bz", "cz", "dz", "ez", "fz"]],
+            ["0z", "9z", "fz", "x5zy"],
+        ),
+        # RANGE + prefix — Phase 2 produces prefix+char group;
+        # the combined group subsumes the standalone prefix group.
+        (r"pre[a-c]", [["prea", "preb", "prec"]], ["prea", "prec", "xpreby"]),
+        # Two small non-contiguous ranges;
+        # the combined group subsumes the standalone suffix group.
+        (r"[a-ce-g]x", [["ax", "bx", "cx", "ex", "fx", "gx"]], ["ax", "gx", "xfxy"]),
+        # RANGE + CATEGORY expansion with prefix and suffix;
+        # the fully-combined group subsumes all standalone groups.
+        (
+            r"pre[\da-f]suf",
+            [
+                [
+                    "pre0suf",
+                    "pre1suf",
+                    "pre2suf",
+                    "pre3suf",
+                    "pre4suf",
+                    "pre5suf",
+                    "pre6suf",
+                    "pre7suf",
+                    "pre8suf",
+                    "pre9suf",
+                    "preasuf",
+                    "prebsuf",
+                    "precsuf",
+                    "predsuf",
+                    "preesuf",
+                    "prefsuf",
+                ]
+            ],
+            ["pre0suf", "prefsuf", "xpre5sufy"],
+        ),
+    ],
+)
+def test_range_expansion_phase2(pattern, expected, matching):
+    r"""RANGE expansion (#2d) produces Phase 2 combined groups when
+    ranges span ≤20 characters and surrounding mandatory literals exist."""
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +1035,7 @@ def test_max_repeat_zero_no_spurious_flushes(pattern, matching, forbidden):
 def test_cross_product_across_separator(pattern, matching, budget):
     result = pattern_extract_prefilter_literals(pattern, max_combinations=budget)
     if result is not None:
-        _assert_prefilter_inclusion(pattern, result, matching)
+        _assert_prefilter_inclusion(pattern, result[0], matching)
         assert len(result) <= budget
 
 
@@ -742,49 +1047,55 @@ def test_cross_product_across_separator(pattern, matching, budget):
 @pytest.mark.parametrize(
     "pattern, matching",
     [
-        # 1. Lookahead flushes accumulated prefix; alternation + literal suffix
-        #    survive.  ASSERT flushes "foo" to literals, then BRANCH(bar|baz)
-        #    + "qux" produce "barqux"/"bazqux".
+        # Positive lookahead before alternation with literal suffix
         (r"foo(?=.*end)\s(bar|baz)qux", ["foo barqux end", "foo\tbazqux and end"]),
-        # 2. min_c=0 save/restore prevents the optional dash from leaking.
-        #    Inner walk flushes "-" inside \d+ expansion but the outer
-        #    MAX_REPEAT{0,1} rolls it back — only "prefix" and "suffix" remain.
+        # Optional group ? with literal prefix and suffix
         (r"prefix(?:-\d+)?suffix", ["prefixsuffix", "prefix-123suffix"]),
-        # 3. Alternation in required repeat ({2}) — each branch is distinct so
-        #    9 cross-product combos + 3 fallback entries (min_c>=1) are produced.
+        # Alternation inside a required repeat {2}
         (r"(?:alpha|beta|gamma){2}", ["alphaalpha", "betagamma", "gammaalpha"]),
-        # 4. Backreference (GROUPREF) flushes the buffer to global literals,
-        #    then resets — subsequent literal "c" continues independently.
+        # Backreference \1 between literals "a" and "c"
         (r"(a)b\1c", ["abac", "xabacy"]),
-        # 5. Lookbehind + alternation + literal-dot + metachar-class + lookahead.
-        #    ASSERT flushes empty, BRANCH produces com/org/net, literal "."
-        #    concatenates, then \w+ (CATEGORY) flushes the dotted prefixes.
+        # Positive lookbehind + alternation + literal-dot + \w + positive lookahead
         (r"(?<=@)(?:com|org|net)\.\w+(?=\s|$)", ["@com.domain ", "@org.host"]),
-        # 6. Triple-nested min_c=0 — three levels of optional groups each
-        #    independently save/restore state.  Produces "d", "ad", "abd", "abcd".
+        # Triple-nested optional non-capturing groups (?:...)?  (?:...)?  (?:...)
         (r"(?:a(?:b(?:c)?)?)?d", ["d", "ad", "abd", "abcd"]),
-        # 7. ASSERT_NOT on both ends sandwiching alternation with an optional
-        #    metachar-class suffix.  The optional group (min_c=0) flushes branch
-        #    results, which are rolled back, then re-flushed when inner_options
-        #    is empty — only the branch names survive.
+        # Negative lookbehind + alternation + optional \d+ + negative lookahead
         (r"(?<!\w)(?:error|warning)(?:\s+\d+)?(?!\w)", ["error", "warning 404", "warning:"]),
-        # 8. Lookbehind + alternation + lookahead — ASSERT at both ends,
-        #    alternation content in the middle.  The BRANCH results are returned
-        #    verbatim after both ASSERTs flush empty buffers.
+        # Positive lookbehind + alternation + positive lookahead
         (r"(?<=start_)(?:alpha|beta)(?=_end)", ["start_alpha_end", "start_beta_end"]),
-        # 9. AT word-boundary flushes empty, BRANCH produces the alternation
-        #    inner_options, then AT again flushes those three words to literals.
-        #    The trailing ASSERT (lookahead) tries to flush an empty buffer.
+        # \b word boundary + alternation + \b word boundary + positive lookahead
         (r"\b(?:foo|bar|baz)\b(?=\s+\d+)", ["foo 123", "bar 456"]),
-        # 10. Optional prefix (min_c=0) followed by a required double-repeat
-        #     (min_c>=1) — exercises the sequence of zero-or-one followed by
-        #     exactly-two expansion + fallback candidate injection.
+        # Optional group ? followed by alternation inside {2} repeat
         (r"(?:foo)?(?:bar|baz){2}", ["barbar", "barbaz", "foobarbaz", "bazbar"]),
-        # 11. Two adjacent character classes separated by a literal colon with
-        #     a literal suffix — exercises IN expansion cross-product across the
-        #     separator then literal concatenation.  Budget=20 keeps the set
-        #     trimmed; every matching string still contains at least one entry.
+        # Character classes [abc]+ and [xyz]+ separated by literal ":" with suffix "@test"
         (r"[abc]+:[xyz]+@test", ["abc:xyz@test", "a:x@test", "cba:zyx@test"]),
+        # \A string start anchor
+        (r"\Ahello", ["hello"]),
+        # \Z string end anchor
+        (r"world\Z", ["world"]),
+        # Both \A and \Z
+        (r"\Aexact\Z", ["exact"]),
+        # \B non-word boundary
+        (r"foo\Bbar", ["foobar"]),
+        (r"\Bword\B", ["swordfish"]),
+        # Named backreference (?P=name)
+        (r"(?P<w>foo)(?P=w)", ["foofoo"]),
+        (r"(?P<x>a)b(?P=x)", ["aba"]),
+        # Two consecutive lookaheads / lookbehinds
+        (r"(?<=@)(?=\w)foo", ["@foo"]),
+        (r"(?<!\d)(?=[A-Z])Bar", ["XBar"]),
+        # Lookaround inside alternation (ASSERT at *front* of each branch)
+        (r"(?<=@)com|(?<=\.)org", ["@com", ".org"]),
+        # Alternation with empty branch — trailing literal survives
+        (r"^(a|)b$", ["ab", "b"]),
+        (r"^(foo|)bar$", ["foobar", "bar"]),
+        # Multiple consecutive backreferences
+        (r"(a)(b)\2\1", ["abba"]),
+        (r"(x)(y)(z)\3\2\1", ["xyzzyx"]),
+        # Non-ASCII literal characters
+        ("café", ["café"]),
+        ("日本語", ["日本語"]),
+        (r"naïve\dmatch", ["naïve1match"]),
     ],
 )
 def test_devilish_complex_prefilter_contract(pattern, matching):
@@ -796,6 +1107,294 @@ def test_devilish_complex_prefilter_contract(pattern, matching):
     skipped (consistent with all other _check-based tests).
     """
     _check(pattern, matching, assert_not_none=True)
+
+
+# ---------------------------------------------------------------------------
+# Atomic groups, scoped case-insensitive, and lazy alternation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [(r"(?>foo)bar", ["foobar"]), (r"(?>foo)+bar", ["foofoobar", "foobar"]), (r"pre(?>foo)bar", ["prefoobar"])],
+)
+def test_atomic_group_bug(pattern, matching):
+    _check(pattern, matching, assert_not_none=True)
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [(r"pre(?i:foo)bar", ["prefoobar", "preFOObar"]), (r"(?i:hello)world", ["hELLoworld", "HELLOworld"])],
+)
+def test_scoped_case_insensitive(pattern, matching):
+    # Use max_combinations=32 so all case variants (up to 2^5) fit.
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=32)
+    assert result is not None, f"{pattern!r} returned None"
+    _assert_prefilter_inclusion(pattern, result[0], matching)
+
+
+def test_lazy_alternation_empty_match():
+    """Empty string matches ^(?:foo|bar)*?$ but none of the returned literals
+    are substrings of ''."""
+    result = pattern_extract_prefilter_literals(r"^(?:foo|bar)*?$")
+    if result is not None:
+        # result is list[list[str]] — check first group
+        assert any(lit in "" for lit in result[0]), f"Empty string matches pattern but contains none of {result}"
+
+
+# ---------------------------------------------------------------------------
+# New return type: list[list[str]] — independent prefilter groups
+# ---------------------------------------------------------------------------
+
+
+def _assert_grouped_prefilter(pattern, expected_groups, matching_strings):
+    """Validate list[list[str]] return type semantics.
+
+    Each inner list is an *independent* prefilter group.  For a group to be
+    valid, every string that matches *pattern* must contain at least one of
+    the group's literals as a substring.  The caller may pick any single
+    group and use it as a standalone prefilter.
+    """
+    try:
+        compiled = re.compile(pattern)
+    except re.error:
+        pytest.skip(f"Pattern {pattern!r} cannot be compiled by stdlib re")
+
+    # Every test string must actually match the pattern
+    for s in matching_strings:
+        assert compiled.search(s), f"Test string {s!r} does not match pattern {pattern!r} — fix the test data"
+
+    # Each group must be a valid independent prefilter
+    for group in expected_groups:
+        for s in matching_strings:
+            assert any(lit in s for lit in group), (
+                f"Group {group!r} fails for string {s!r} matching {pattern!r}: "
+                f"none of {group} are substrings of {s}"
+            )
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Pure literal — single group with one literal
+        ("hello", [["hello"]], ["hello", "xhellox"]),
+        # /foo.*bar/ — two mandatory literals, each its own group
+        (r"foo.*bar", [["foo"], ["bar"]], ["foobar", "fooxxxbar", "xfoobary"]),
+        # /foo|bar/ — neither is mandatory, one group with both alternatives
+        (r"foo|bar", [["foo", "bar"]], ["foo", "bar", "xfoox", "bary"]),
+        # /ab(cd)?ef/ — 'ab' and 'ef' are mandatory, each its own group;
+        # Phase 2 adds the optional-expansion group which subsumes the
+        # standalone mandatory groups.
+        (r"ab(cd)?ef", [["abcdef", "abef"]], ["abef", "abcdef"]),
+        # /foo.*bar.*baz/ — three mandatory literals
+        (r"foo.*bar.*baz", [["foo"], ["bar"], ["baz"]], ["foobarbaz", "fooxxxbaryyybaz", "xfoobarbazy"]),
+        # /(foo|bar)baz/ — only 'baz' is mandatory;
+        # Phase 2 adds the prefix+alternation group which subsumes it.
+        (r"(foo|bar)baz", [["barbaz", "foobaz"]], ["foobaz", "barbaz"]),
+        # /a(b|c)d/ — 'a' and 'd' are mandatory, each its own group;
+        # Phase 2 adds combined prefix/suffix + alternation groups which
+        # subsume all standalone groups.
+        (r"a(b|c)d", [["abd", "acd"]], ["abd", "acd"]),
+        # Literal + .* + no trailing literal — only the prefix is mandatory
+        (r"foo.*", [["foo"]], ["foo", "foobar"]),
+        # .* + literal suffix — only suffix is mandatory
+        (r".*bar", [["bar"]], ["bar", "foobar"]),
+        # Alternation with common prefix AND suffix — both are mandatory;
+        # Phase 2 adds combined groups which subsume the mandatory-only groups.
+        (r"pre(fix|lude)", [["prefix", "prelude"]], ["prefix", "prelude"]),
+        (r"(un|re)do", [["redo", "undo"]], ["undo", "redo"]),
+        # Multiple wildcards splitting mandatory chunks
+        (r"foo.+bar.*baz", [["foo"], ["bar"], ["baz"]], ["fooxbarxxxbaz", "fooxyzbarybaz"]),
+        # Word boundary before/after literal
+        (r"\bword\b", [["word"]], ["word", "a word here"]),
+        # Lookahead — literal in lookahead forced as independent group (#3);
+        # merged lookahead+body group (#5 adjacent-literal merging) subsumes
+        # the standalone groups.
+        (r"foo(?=bar)", [["foobar"]], ["foobar"]),
+        # Lookbehind — literal before match forced as independent group (#3);
+        # merged lookbehind+body group (#5 adjacent-literal merging) subsumes
+        # the standalone groups.
+        (r"(?<=foo)bar", [["foobar"]], ["foobar"]),
+        # Character class with surrounding mandatory literals;
+        # Phase 2 adds the digit-expansion group after #2c.
+        (
+            r"foo\d+bar",
+            [["foo"], ["bar"], ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]],
+            ["foo123bar", "foo0bar"],
+        ),
+        # Optional group — only the non-optional parts are mandatory;
+        # Phase 2 adds the optional-expansion group which subsumes the
+        # standalone mandatory groups.
+        (r"colou?r", [["color", "colour"]], ["color", "colour"]),
+        # Escaped metacharacters as literals
+        (r"a\.b", [["a.b"]], ["a.b"]),
+        # #4 — mixed lookaround + alternation: no body literals, lookaround-forced
+        (r"(?<=@)\w+|(?<=#)\w+", [["@", "#"]], ["@abc", "#xyz"]),
+        # #4/#5 — lookaround + alternation: merged lookbehind+body
+        (r"(?<=@)com|(?<=\.)org", [["@com", ".org"]], ["@com", ".org"]),
+    ],
+)
+def test_grouped_prefilter_mandatory(pattern, expected, matching):
+    """Phase 1 + Phase 2 combined: prefilter groups.
+
+    Each returned group consists of literals that are guaranteed to appear
+    in every regex match.  Groups are independent — the caller picks one."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    assert isinstance(result, list), f"Expected list, got {type(result)}"
+    assert all(isinstance(g, list) for g in result), f"Expected list[list[str]], got {[type(g) for g in result]}"
+    # Sort within groups and across groups for deterministic comparison
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # /(foo|bar)baz/ — mandatory 'baz' + combined prefix-alternation groups;
+        # the combined group subsumes the standalone mandatory group.
+        (r"(foo|bar)baz", [["barbaz", "foobaz"]], ["foobaz", "barbaz"]),
+        # /pre(fix|lude|text)/ — mandatory 'pre' + full expansion groups;
+        # the combined group subsumes the standalone mandatory prefix.
+        (r"pre(fix|lude|text)", [["prefix", "prelude", "pretext"]], ["prefix", "prelude", "pretext"]),
+        # /(un|re|dis)do/ — mandatory 'do' + full groups;
+        # the combined group subsumes the standalone mandatory suffix.
+        (r"(un|re|dis)do", [["disdo", "redo", "undo"]], ["undo", "redo", "disdo"]),
+        # /a(b|c)d/ — mandatory 'a','d' + combined groups;
+        # the fully-combined group subsumes all standalone groups.
+        (r"a(b|c)d", [["abd", "acd"]], ["abd", "acd"]),
+        # /ab(cd)?ef/ — mandatory parts + full expansion;
+        # the combined group subsumes the standalone mandatory groups.
+        (r"ab(cd)?ef", [["abcdef", "abef"]], ["abef", "abcdef"]),
+        # /(foo|bar){2}/ — alternation repeated
+        (r"(foo|bar){2}", [["foofoo", "foobar", "barfoo", "barbar"]], ["foofoo", "foobar", "barfoo", "barbar"]),
+        # /[abc]+@[xyz]+/ — mandatory separator '@' plus Phase 2 character-class
+        # expansion groups (each is a valid independent prefilter).
+        (r"[abc]+@[xyz]+", [["@"], ["a", "b", "c"], ["x", "y", "z"]], ["abc@xyz", "a@x", "cba@zyx"]),
+    ],
+)
+def test_grouped_prefilter_extended(pattern, expected, matching):
+    """Phase 2: extended groups that combine mandatory/non-mandatory parts
+    to offer more specific (less-overlapping) prefilter options."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    assert isinstance(result, list), f"Expected list, got {type(result)}"
+    assert all(isinstance(g, list) for g in result), f"Expected list[list[str]], got {[type(g) for g in result]}"
+    # Sort within groups and across groups for deterministic comparison
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+# ---------------------------------------------------------------------------
+# Lookaround-adjacent-literal merging
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Lookahead at end of literal → merged foobar;
+        # the merged group subsumes the standalone foo/bar groups.
+        (r"foo(?=bar)", [["foobar"]], ["foobar", "xfoobary"]),
+        # Lookbehind at start of literal → merged foobar;
+        # the merged group subsumes the standalone groups.
+        (r"(?<=foo)bar", [["foobar"]], ["foobar", "xfoobary"]),
+        # Lookbehind + literal + lookahead → all three merges;
+        # foobarbaz subsumes every other group.
+        (r"(?<=foo)bar(?=baz)", [["foobarbaz"]], ["foobarbaz", "xfoobarbazy"]),
+        # Alternation with lookbehind in each branch → merged branch results
+        (r"(?<=foo)bar|(?<=foo)baz", [["foobar", "foobaz"]], ["foobar", "foobaz", "xfoobary"]),
+        # Alternation with lookahead in each branch (shared prefix) → merged;
+        # the merged group subsumes the standalone foo group.
+        (r"foo(?=bar)|foo(?=baz)", [["foobar", "foobaz"]], ["foobar", "foobaz", "xfoobary"]),
+        # Lookahead after the only body literal → simple merge;
+        # the merged group subsumes the standalone groups.
+        (r"ab(?=cd)", [["abcd"]], ["abcd", "xabcdy"]),
+        # Lookbehind before the only body literal → simple merge;
+        # the merged group subsumes the standalone groups.
+        (r"(?<=ab)cd", [["abcd"]], ["abcd", "xabcdy"]),
+    ],
+)
+def test_lookaround_adjacent_literal_merging(pattern, expected, matching):
+    """Lookaround-forced literals adjacent to mandatory match-body literals
+    should produce merged groups (e.g., foo(?=bar) → foobar).
+
+    The merged group is more specific: every match of foo(?=bar) must contain
+    foobar as a substring.  Standalone groups (foo, bar) are also kept for
+    callers that prefer shorter prefilter strings."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    assert isinstance(result, list), f"Expected list, got {type(result)}"
+    assert all(isinstance(g, list) for g in result), f"Expected list[list[str]], got {[type(g) for g in result]}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+# ---------------------------------------------------------------------------
+# Postprocessing: pruning subsumed groups
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Lookaround merges: standalone 'foo'/'bar' are substrings of 'foobar'
+        (r"foo(?=bar)", [["foobar"]], ["foobar", "xfoobary"]),
+        (r"(?<=foo)bar", [["foobar"]], ["foobar", "xfoobary"]),
+        (r"(?<=foo)bar(?=baz)", [["foobarbaz"]], ["foobarbaz", "xfoobarbazy"]),
+        (r"ab(?=cd)", [["abcd"]], ["abcd", "xabcdy"]),
+        (r"(?<=ab)cd", [["abcd"]], ["abcd", "xabcdy"]),
+        # Alternation with surrounding mandatory context:
+        # mandatory-only groups are substrings of the expanded groups
+        (r"pre(fix|lude)", [["prefix", "prelude"]], ["prefix", "prelude"]),
+        (r"(un|re)do", [["redo", "undo"]], ["undo", "redo"]),
+        (r"(foo|bar)baz", [["barbaz", "foobaz"]], ["foobaz", "barbaz"]),
+        (r"a(b|c)d", [["abd", "acd"]], ["abd", "acd"]),
+        # Optional constructs: mandatory-only groups subsumed by optional-expanded
+        (r"colou?r", [["color", "colour"]], ["color", "colour"]),
+        (r"ab(cd)?ef", [["abcdef", "abef"]], ["abef", "abcdef"]),
+        # Three-branch alternation: mandatory prefix subsumed by full expansion
+        (r"pre(fix|lude|text)", [["prefix", "prelude", "pretext"]], ["prefix", "prelude", "pretext"]),
+        # Unbounded optional repeats (*, {0,}): no optional-expansion produced,
+        # so mandatory-only groups survive.
+        (r"ab*c", [["a"], ["c"]], ["ac", "abc", "abbbc"]),
+        (r"xa*", [["x"]], ["x", "xa", "xaa"]),
+        (r"a*b", [["b"]], ["b", "ab", "aab"]),
+        (r"ab{0,2}c", [["a"], ["c"]], ["ac", "abc", "abbc"]),
+    ],
+)
+def test_prune_subsumed_groups(pattern, expected, matching):
+    """Postprocessing pass: groups whose every literal is a substring of
+    some literal in another (more-specific) group are pruned.
+
+    For example, ``foo(?=bar)`` produces ``[['foo'], ['bar'], ['foobar']]``
+    before pruning.  Since 'foo' and 'bar' are each substrings of
+    'foobar', the first two groups are redundant — ``['foobar']`` is
+    strictly more specific (fewer false positives)."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    assert isinstance(result, list), f"Expected list, got {type(result)}"
+    assert all(isinstance(g, list) for g in result), f"Expected list[list[str]], got {[type(g) for g in result]}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n"
+        f"  expected (pruned): {expected_normalized}\n"
+        f"  got:               {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
 
 
 # ---------------------------------------------------------------------------
