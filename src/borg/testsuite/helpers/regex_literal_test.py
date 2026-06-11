@@ -1688,7 +1688,7 @@ def test_alternation_shorten_split_core():
             "fooghi123bar",
             "fooijklmnbar",
             "fooijkXXXlmnbar",
-            "fooopqrstbar",
+            "fooopqXrstbar",
             "fooopqYYYrstbar",
         ],
     )

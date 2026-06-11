@@ -606,7 +606,7 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                 result = _shorten_branch_literals(branch)
                 if result is None:
                     return None
-                branch_lits, _ls, _ts = result
+                branch_lits, _ls, _ts, _split_trailing = result
                 branch_cores.extend(branch_lits)
             # If the BRANCH has items before/after it in core_items,
             # those are literal prefixes/suffixes to each branch result.
@@ -670,15 +670,20 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                 chars.extend(_collect_literal_chars_from_items(inner))
         return chars
 
-    def _shorten_branch_literals(node) -> tuple[list[str], bool, bool] | None:
+    def _shorten_branch_literals(node) -> tuple[list[str], bool, bool, list[str] | None] | None:
         """Extract guaranteed literal substrings from a branch *node*
         after stripping leading and trailing expansible content.
 
-        Returns (literals, leading_shortened, trailing_shortened) or None
-        if no literal core can be found.
+        Returns (literals, leading_shortened, trailing_shortened, split_trailing_lits)
+        or None if no literal core can be found.
 
         - leading_shortened: True if leading expansible content was stripped.
         - trailing_shortened: True if trailing expansible content was stripped.
+        - split_trailing_lits: when set, these are trailing-side cores that
+          attach to the suffix only (leading IS shortened by expansible middle).
+          Used for the split-core case where literal content exists on both
+          sides of expansible middle content (e.g. opq.+rst yields ['opq']
+          as primary and ['rst'] as split_trailing_lits).
 
         A "shortened" flag being True means the literal result's position
         relative to external prefix/suffix is uncertain on that side."""
@@ -700,7 +705,7 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
         # Exception: if left_stop > right_stop the walks overlapped
         # (pure literal branch).
         if left_stop > right_stop:
-            return [leading_prefix], False, False
+            return [leading_prefix], False, False, None
         # leading_shortened: True if there was expansible content on the
         # leading edge that was stripped.  A BRANCH at the leading edge
         # is NOT "shortened" — it's the literal core (nested alternation).
@@ -746,16 +751,27 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
             result = leading_prefix + trailing_suffix
             if not result:
                 return None
-            return [result], leading_shortened, trailing_shortened
+            return [result], leading_shortened, trailing_shortened, None
 
         # Extract literal cores from the middle
         inner_lits = _extract_inner_literal_cores(middle)
         if inner_lits is None:
-            # No core found in middle
+            # No core found in middle.
+            # Split-core detection: when there is literal content on BOTH
+            # sides of expansible-only middle content, the two literal parts
+            # must be produced as SEPARATE results.
+            #   e.g. opq.+rst → ['opq'] (prefix_lits) + ['rst'] (suffix_lits)
+            # Concatenating them (opqrst) is NOT valid.
+            if leading_prefix and trailing_suffix:
+                # Leading part attaches to prefix (trailing IS shortened
+                # by the expansible middle).
+                # Trailing part attaches to suffix (leading IS shortened
+                # by the expansible middle).
+                return [leading_prefix], False, True, [trailing_suffix]
             result = leading_prefix + trailing_suffix
             if not result:
                 return None
-            return [result], leading_shortened, trailing_shortened
+            return [result], leading_shortened, trailing_shortened, None
 
         # Combine leading + each core + trailing
         # Filter out empty strings from inner_lits
@@ -764,10 +780,10 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
             result = leading_prefix + trailing_suffix
             if not result:
                 return None
-            return [result], leading_shortened, trailing_shortened
+            return [result], leading_shortened, trailing_shortened, None
 
         results = [leading_prefix + c + trailing_suffix for c in effective_inner]
-        return sorted(set(results)), leading_shortened, trailing_shortened
+        return sorted(set(results)), leading_shortened, trailing_shortened, None
 
     def _collect_branch_results_shortened(branches, flags: int):
         """Like _collect_branch_results but falls back to branch shortening
@@ -808,7 +824,7 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                         return None  # can't guarantee coverage
                 continue
 
-            lits, leading_short, trailing_short = shortened
+            lits, leading_short, trailing_short, split_trailing_lits = shortened
             if not lits:
                 return None
             if leading_short and trailing_short:
@@ -819,6 +835,8 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                 prefix_only.extend(lits)
             else:
                 pure.extend(lits)
+            if split_trailing_lits:
+                suffix_only.extend(split_trailing_lits)
 
         return (
             sorted(set(pure)) if pure else [],
