@@ -1425,6 +1425,247 @@ def test_prune_subsumed_groups(pattern, expected, matching):
 
 
 # ---------------------------------------------------------------------------
+# Alternation branch shortening — strip expansible endings to fit budget
+# ---------------------------------------------------------------------------
+
+
+def test_alternation_shorten_real_world_path_pattern():
+    """Real-world path pattern with expansible content in alternation branches.
+
+    When alternation branches contain expansible content like [^/]*, [^/]+, \\d+
+    that makes them non-expandable via _branch_literal_string, the function
+    should shorten each branch by stripping trailing expansible parts to produce
+    valid prefilter literals that fit within the budget.
+
+    Previously this returned just ['Library/Application Support/'] (the mandatory
+    prefix before the alternation), losing the branch-specific information."""
+    pattern = (
+        r"^(Users/[^/]+/)?Library/Application Support/"
+        r"(Firefox|Apple[^/]*|Google[^/]*|Microsoft|GarageBand|Logic|"
+        r"com\.(apple|microsoft)\.[^/]+|Postman|Slack|"
+        r"Docker Desktop|iStat Menus \d+|Spotify|pipx|Cypress|"
+        r"iLifeMediaBrowser)$"
+    )
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    expected = [
+        "Library/Application Support/Apple",
+        "Library/Application Support/Cypress",
+        "Library/Application Support/Docker Desktop",
+        "Library/Application Support/Firefox",
+        "Library/Application Support/GarageBand",
+        "Library/Application Support/Google",
+        "Library/Application Support/Logic",
+        "Library/Application Support/Microsoft",
+        "Library/Application Support/Postman",
+        "Library/Application Support/Slack",
+        "Library/Application Support/Spotify",
+        "Library/Application Support/com.apple.",
+        "Library/Application Support/com.microsoft.",
+        "Library/Application Support/iLifeMediaBrowser",
+        "Library/Application Support/iStat Menus ",
+        "Library/Application Support/pipx",
+    ]
+    assert result is not None, "Expected non-None for path pattern, got None"
+    assert sorted(result[0]) == sorted(expected), (
+        f"Expected {len(expected)} shortened branch literals,\n" f"got {sorted(result[0])}"
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Trailing expansible char class [^/]* stripped from branches
+        (r"(foo|bar[^/]*|baz)qux", [["bar", "bazqux", "fooqux"]], ["fooqux", "barqux", "barSomethingqux", "bazqux"]),
+        # Trailing \d+ stripped from one branch
+        (
+            r"prefix(foo|bar\d+)suffix",
+            [["prefixbar", "prefixfoosuffix"]],
+            ["prefixfoosuffix", "prefixbar123suffix", "prefixbar1suffix"],
+        ),
+        # Leading \d+ stripped from one branch
+        (
+            r"prefix(\d+bar|baz)suffix",
+            [["barsuffix", "prefixbazsuffix"]],
+            ["prefix123barsuffix", "prefixbazsuffix", "prefix1barsuffix"],
+        ),
+        # Trailing [^/]+ stripped from nested alternation
+        (
+            r"com\.(apple|microsoft)\.[^/]+",
+            [["com.apple.", "com.microsoft."]],
+            ["com.apple.something", "com.microsoft.other", "com.apple.x"],
+        ),
+        # Mixed: some pure-literals, some with expansible endings
+        (
+            r"(Firefox|Apple[^/]*|Google[^/]*|Microsoft)",
+            [["Apple", "Firefox", "Google", "Microsoft"]],
+            ["Firefox", "Apple", "AppleXYZ", "GoogleStuff", "Microsoft"],
+        ),
+        # Trailing whitespace-then-\d+ stripped
+        (r"(iStat Menus \d+|Spotify)", [["Spotify", "iStat Menus "]], ["iStat Menus 5", "Spotify", "iStat Menus 42"]),
+        # Both leading and trailing expansible stripped; no common prefix/suffix
+        (r"\d+mid\d+|other", [["mid", "other"]], ["123mid456", "other", "0mid9"]),
+    ],
+)
+def test_alternation_shorten_branches(pattern, expected, matching):
+    """When alternation branches contain expansible content that would
+    overflow the budget, branches should be shortened by stripping leading
+    and trailing expansible parts to produce valid prefilter literals.
+
+    The shortened literal is always guaranteed to be a substring of every
+    match of the original branch, so the prefilter contract holds."""
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Shortening with common prefix before alternation
+        (
+            r"pre/(foo|bar\d+|baz)\d*",
+            [["pre/bar", "pre/baz", "pre/foo"]],
+            ["pre/foo999", "pre/bar123", "pre/baz", "pre/bar1"],
+        ),
+        # Shortening with common suffix after alternation
+        (
+            r"[^/]*(alpha|beta|gamma[^/]+)suf",
+            [["alphasuf", "betasuf", "gamma"]],
+            ["xxxalphasuf", "xxxbetasuf", "xxxgammaYYYsuf", "alphasuf"],
+        ),
+        # Shortening with both prefix and suffix, some branches already pure
+        (
+            r"pre(foo|bar\d+|baz)suf",
+            [["prebar", "prebazsuf", "prefoosuf"]],
+            ["prefoosuf", "prebar1suf", "prebar42suf", "prebazsuf"],
+        ),
+    ],
+)
+def test_alternation_shorten_with_surrounding_context(pattern, expected, matching):
+    """Shortening should work together with surrounding mandatory context
+    (prefix/suffix outside the alternation)."""
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Shortened result fits under tight budget (e.g. max_combinations=6
+        # for a 6-branch alternation with the prefix)
+        (
+            r"pre(foo|bar\d+|baz|qux\d*|abc|xyz\d+)suf",
+            [["preabcsuf", "prebar", "prebazsuf", "prefoosuf", "prequx", "prexyz"]],
+            ["prefoosuf", "prebar123suf", "prebazsuf", "prequx99suf", "preabcsuf", "prexyz99suf"],
+        )
+    ],
+)
+def test_alternation_shorten_budget_constrained(pattern, expected, matching):
+    """Shortened branches must respect max_combinations budget."""
+    # Exact fit: 6 combos, budget=6
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=6)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Both-side shortening: branches shortened on trailing side use prefix,
+        # branches shortened on leading side use suffix.
+        (
+            r"foo(ab[^/]*|[^/]*AB|other)bar",
+            [["fooab", "foootherbar", "ABbar"]],
+            ["fooabXYZbar", "fooXYZABbar", "foootherbar"],
+        ),
+        # Both-side shortening with only prefix outside (no suffix)
+        (r"pre/(ab\d*|\d*AB|xyz)", [["pre/ab", "pre/xyz", "AB"]], ["pre/ab123", "pre/987AB", "pre/xyz"]),
+        # Both-side shortening with only suffix outside (no prefix)
+        (r"(ab\d*|\d*AB|xyz)suf", [["ab", "ABsuf", "xyzsuf"]], ["ab999suf", "123ABsuf", "xyzsuf"]),
+        # Shortened on both ends within single branch: \d*mid\d*
+        (r"foo(\d*mid\d*|other)bar", [["foootherbar", "mid"]], ["foo123mid456bar", "foootherbar"]),
+        # Nested alternation with trailing expansible
+        (
+            r"pre/((ab|cd)\d+|(ef|gh)[^/]*|xyz)suf",
+            [["pre/ab", "pre/cd", "pre/ef", "pre/gh", "pre/xyzsuf"]],
+            ["pre/ab123suf", "pre/cd99suf", "pre/efXYZsuf", "pre/ghXsuf", "pre/xyzsuf"],
+        ),
+        # Nested alternation with leading expansible
+        (
+            r"pre/(\d+(ab|cd)|[^/]*(ef|gh)|xyz)suf",
+            [["absuf", "cdsuf", "efsuf", "ghsuf", "pre/xyzsuf"]],
+            ["pre/123absuf", "pre/99cdsuf", "pre/Xefsuf", "pre/Xghsuf", "pre/xyzsuf"],
+        ),
+        # Nested alternation with expansible on both sides
+        (
+            r"pre/(\d+(ab|cd)\d*|[^/]*(ef|gh)\d*|xyz)suf",
+            [["ab", "cd", "ef", "gh", "pre/xyzsuf"]],
+            ["pre/123ab456suf", "pre/1cd99suf", "pre/Xef123suf", "pre/ghsuf", "pre/xyzsuf"],
+        ),
+        # Character class expansion with trailing shortening
+        (
+            r"pre/([abc]+\d*|xyz)suf",
+            [["pre/a", "pre/b", "pre/c", "pre/xyzsuf"]],
+            ["pre/aaa123suf", "pre/b99suf", "pre/csuf", "pre/xyzsuf"],
+        ),
+        # Character class inside nested alternation, shortened
+        (
+            r"pre/(foo|[abc]+\d*|xyz)suf",
+            [["pre/a", "pre/b", "pre/c", "pre/foosuf", "pre/xyzsuf"]],
+            ["pre/aaa123suf", "pre/b99suf", "pre/csuf", "pre/foosuf", "pre/xyzsuf"],
+        ),
+        # Large alternation with mixed shortening (some trailing, some leading, some both)
+        (
+            r"prefix(ab\d*|\d*cd|ef[^/]*|[^/]*gh|ij|\d*kl\d*)suffix",
+            [["cdsuffix", "ghsuffix", "kl", "prefixab", "prefixef", "prefixijsuffix"]],
+            [
+                "prefixab123suffix",
+                "prefix987cdsuffix",
+                "prefixefXYZsuffix",
+                "prefixUVWghsuffix",
+                "prefixijsuffix",
+                "prefix12kl34suffix",
+            ],
+        ),
+    ],
+)
+def test_alternation_shorten_both_sides(pattern, expected, matching):
+    """Shortening must work on both sides of each branch: trailing expansible
+    content is stripped and the result attaches to the prefix; leading
+    expansible content is stripped and the result attaches to the suffix.
+
+    For branches shortened on BOTH ends (e.g. \\d*mid\\d*), only the inner
+    literal core is returned, combined with neither prefix nor suffix.
+
+    Nested alternations and expandable character classes should also be
+    shortened when surrounded by expansible content."""
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    _assert_grouped_prefilter(pattern, expected, matching)
+
+
+# ---------------------------------------------------------------------------
 # Unparseable patterns — should return None
 # ---------------------------------------------------------------------------
 

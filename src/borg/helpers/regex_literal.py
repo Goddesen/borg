@@ -118,8 +118,14 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
     _pending_alt_repeat_ctx: list[tuple[str, list[str], int, int]] = []
     # Pending optional contexts: (prefix, optional_literal)
     _pending_opt_ctx: list[tuple[str, str]] = []
+    # Pending shortened alternation contexts:
+    # (prefix, pure_lits, prefix_lits, suffix_lits, core_lits)
+    _pending_shortened_alt_ctx: list[tuple[str, list[str], list[str], list[str], list[str]]] = []
     # Resolved alternation contexts: (prefix, branch_literals, suffix)
     _alt_contexts: list[tuple[str, list[str], str]] = []
+    # Resolved shortened alternation contexts:
+    # (prefix, pure_lits, prefix_lits, suffix_lits, core_lits, suffix)
+    _shortened_alt_contexts: list[tuple[str, list[str], list[str], list[str], list[str], str]] = []
     # Resolved alternation-repeat contexts:
     # (prefix, branch_literals, suffix, repeat_min, repeat_max)
     _alt_repeat_contexts: list[tuple[str, list[str], str, int, int]] = []
@@ -394,6 +400,433 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                     results.extend(sub)
         return sorted(set(results)) if results else None
 
+    # ---- Branch shortening (strip expansible edges) ----
+
+    def _is_nonliteral_strippable(opcode, value) -> bool:
+        """Check whether a single AST item is non-literal expansible
+        content that can be stripped from the edge of a branch.
+
+        An item is strippable if it matches variable/unbounded content:
+        - IN / ANY (character class, not a fixed literal)
+        - MAX_REPEAT/MIN_REPEAT where the repeat max is >1 or unbounded
+          (e.g. +, *, {n,}, {n,m} with m>n)
+        - SUBPATTERN/ATOMIC_GROUP containing strippable content."""
+        if opcode is _parser.IN or opcode is _parser.ANY:
+            return True
+        if opcode in (_parser.MAX_REPEAT, _parser.MIN_REPEAT):
+            min_c, max_c, inner = value
+            # A repeat is strippable if its max is unbounded (>1 repetition
+            # possible) OR if the inner itself is expansible.
+            if max_c != 1:
+                return True
+            # max_c == 1: check inner for expansible content
+            return _contains_strippable(inner)
+        if opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+            inner = value[3] if opcode is _parser.SUBPATTERN else value
+            return _contains_strippable(inner)
+        return False
+
+    def _contains_strippable(node) -> bool:
+        """Check whether *node* contains any strippable non-literal content."""
+        for opcode, value in node:
+            if _is_nonliteral_strippable(opcode, value):
+                return True
+            if opcode is _parser.BRANCH:
+                # BRANCH itself is not strippable, but check its branches
+                for branch in value[1]:
+                    if _contains_strippable(branch):
+                        return True
+        return False
+
+    def _walk_literal_prefix(items):
+        """Walk *items* from the left, collecting literal characters.
+        Stops at the first item that is non-literal AND non-zero-width.
+        Returns (prefix_string, stop_index).
+        stop_index is len(items) if all items were consumed."""
+        chars: list[str] = []
+        for idx, (opcode, value) in enumerate(items):
+            if opcode is _parser.LITERAL:
+                chars.append(chr(value))
+            elif opcode in (_parser.ASSERT, _parser.ASSERT_NOT, _parser.AT):
+                # Zero-width — skip, don't stop
+                continue
+            elif opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                inner = value[3] if opcode is _parser.SUBPATTERN else value
+                inner_prefix, inner_stop = _walk_literal_prefix(inner)
+                if inner_stop < len(inner):
+                    # Inner has non-literal → stop at this item
+                    return "".join(chars), idx
+                if inner_prefix:
+                    chars.append(inner_prefix)
+            else:
+                # Non-literal, non-zero-width → stop
+                return "".join(chars), idx
+        return "".join(chars), len(items)
+
+    def _walk_literal_suffix(items):
+        """Walk *items* from the right, collecting literal characters
+        in reverse.  Stops at the first item that is non-literal AND
+        non-zero-width.
+        Returns (suffix_string, stop_index).
+        stop_index is -1 if all items were consumed."""
+        chars: list[str] = []
+        for idx in range(len(items) - 1, -1, -1):
+            opcode, value = items[idx]
+            if opcode is _parser.LITERAL:
+                chars.append(chr(value))
+            elif opcode in (_parser.ASSERT, _parser.ASSERT_NOT, _parser.AT):
+                continue
+            elif opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                inner = value[3] if opcode is _parser.SUBPATTERN else value
+                inner_suffix, inner_stop = _walk_literal_suffix(inner)
+                if inner_stop >= 0:
+                    return "".join(reversed(chars)), idx
+                if inner_suffix:
+                    chars.append(inner_suffix)
+            else:
+                return "".join(reversed(chars)), idx
+        return "".join(reversed(chars)), -1
+
+    def _try_extract_in_from_item(item) -> list[int] | None:
+        """Try to extract expandable IN characters from an AST item.
+        Only returns characters for LITERAL-based INs (not CATEGORY/RANGE).
+        Unwraps MAX_REPEAT/MIN_REPEAT/SUBPATTERN/ATOMIC_GROUP wrappers.
+        Returns list of char ordinals or None."""
+        opcode, value = item
+        # Unwrap repeat wrappers
+        if opcode in (_parser.MAX_REPEAT, _parser.MIN_REPEAT):
+            _, _, inner = value
+            if len(inner) == 1 and inner[0][0] is _parser.IN:
+                return _collect_literal_in_chars(inner[0][1])
+            # Unwrap nested SUBPATTERN/ATOMIC_GROUP inside repeat
+            if len(inner) == 1 and inner[0][0] in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                sub_op, sub_val = inner[0]
+                sub_inner = sub_val[3] if sub_op is _parser.SUBPATTERN else sub_val
+                if len(sub_inner) == 1 and sub_inner[0][0] is _parser.IN:
+                    return _collect_literal_in_chars(sub_inner[0][1])
+            return None
+        # Unwrap SUBPATTERN/ATOMIC_GROUP
+        if opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+            inner = value[3] if opcode is _parser.SUBPATTERN else value
+            if len(inner) == 1:
+                return _try_extract_in_from_item(inner[0])
+            return None
+        # Direct IN
+        if opcode is _parser.IN:
+            return _collect_literal_in_chars(value)
+        return None
+
+    def _collect_literal_in_chars(in_value) -> list[int] | None:
+        """Like _collect_in_expandable_chars but only returns characters
+        for LITERAL-only IN (no CATEGORY, no RANGE, no NEGATE)."""
+        chars: list[int] = []
+        for opcode, val in in_value:
+            if opcode is _parser.LITERAL:
+                chars.append(val)
+            else:
+                # CATEGORY, RANGE, NEGATE — not a pure-literal class
+                return None
+        return chars if chars else None
+
+    def _extract_inner_literal_cores(items) -> list[str] | None:
+        """Extract guaranteed literal cores from *items* which may contain
+        BRANCH, expandable IN, or LITERAL content between expansible edges.
+
+        Returns a list of literal strings, or None if no core is found."""
+        if not items:
+            return [""]
+
+        # Strip leading expansible, but keep MAX_REPEATs with expandable
+        # IN chars as potential cores (they're at a fixed edge position).
+        start = 0
+        while start < len(items):
+            opcode, value = items[start]
+            if opcode in (_parser.ASSERT, _parser.ASSERT_NOT, _parser.AT):
+                start += 1
+                continue
+            # If this item has an expandable IN, keep it (it's a core candidate)
+            if _try_extract_in_from_item(items[start]) is not None:
+                break
+            if _is_nonliteral_strippable(opcode, value):
+                start += 1
+                continue
+            break
+        end = len(items) - 1
+        while end >= start:
+            opcode, value = items[end]
+            if opcode in (_parser.ASSERT, _parser.ASSERT_NOT, _parser.AT):
+                end -= 1
+                continue
+            if _try_extract_in_from_item(items[end]) is not None:
+                break
+            if _is_nonliteral_strippable(opcode, value):
+                end -= 1
+                continue
+            break
+
+        core_items = items[start : end + 1]
+        if not core_items:
+            return None
+
+        # Check for single expandable IN at the core (edge case: all that
+        # remains is a MAX_REPEAT/IN with expandable chars)
+        if len(core_items) == 1:
+            chars = _try_extract_in_from_item(core_items[0])
+            if chars:
+                return [chr(c) for c in chars]
+
+        # Check for BRANCH — the literal core is the nested alternation.
+        # First, check for a single SUBPATTERN/ATOMIC_GROUP wrapping everything.
+        branch_items = core_items
+        while len(branch_items) == 1 and branch_items[0][0] in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+            opcode, value = branch_items[0]
+            branch_items = value[3] if opcode is _parser.SUBPATTERN else value
+
+        # Look for BRANCH in the (possibly unwrapped) items.
+        # Also check inside individual SUBPATTERN/ATOMIC_GROUP items.
+        branch_opcode = None
+        branch_value = None
+        branch_idx = -1
+        for i, (opcode, value) in enumerate(branch_items):
+            if opcode is _parser.BRANCH:
+                branch_opcode = opcode
+                branch_value = value
+                branch_idx = i
+                break
+            if opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                inner = value[3] if opcode is _parser.SUBPATTERN else value
+                if len(inner) == 1 and inner[0][0] is _parser.BRANCH:
+                    branch_opcode = _parser.BRANCH
+                    branch_value = inner[0][1]
+                    branch_idx = i
+                    break
+        if branch_opcode is _parser.BRANCH:
+            branch_cores: list[str] = []
+            for branch in branch_value[1]:
+                result = _shorten_branch_literals(branch)
+                if result is None:
+                    return None
+                branch_lits, _ls, _ts = result
+                branch_cores.extend(branch_lits)
+            # If the BRANCH has items before/after it in core_items,
+            # those are literal prefixes/suffixes to each branch result.
+            if prefix_items := branch_items[:branch_idx]:
+                pfx = "".join(_collect_literal_chars_from_items(prefix_items))
+                branch_cores = [pfx + c for c in branch_cores]
+            if suffix_items := branch_items[branch_idx + 1 :]:
+                sfx = "".join(_collect_literal_chars_from_items(suffix_items))
+                branch_cores = [c + sfx for c in branch_cores]
+            return sorted(set(branch_cores)) if branch_cores else None
+
+        # Check for expandable IN (also unwrap SUBPATTERN/ATOMIC_GROUP/MAX_REPEAT)
+        if len(core_items) == 1:
+            opcode, value = core_items[0]
+            inner = None
+            if opcode in (_parser.MAX_REPEAT, _parser.MIN_REPEAT):
+                _, _, inner = value
+                if len(inner) == 1 and inner[0][0] is _parser.IN:
+                    chars = _collect_in_expandable_chars(inner[0][1])
+                    if chars:
+                        return sorted(set(chr(c) for c in chars))
+            elif opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                inner = value[3] if opcode is _parser.SUBPATTERN else value
+                # Unwrap nested SUBPATTERN/ATOMIC_GROUP to find IN or BRANCH
+                while len(inner) == 1 and inner[0][0] in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                    iv = inner[0]
+                    inner = iv[1][3] if iv[0] is _parser.SUBPATTERN else iv[1]
+                if len(inner) == 1 and inner[0][0] is _parser.IN:
+                    chars = _collect_in_expandable_chars(inner[0][1])
+                    if chars:
+                        return sorted(set(chr(c) for c in chars))
+                # Also check for MAX_REPEAT wrapping IN inside SUBPATTERN
+                if len(inner) == 1 and inner[0][0] in (_parser.MAX_REPEAT, _parser.MIN_REPEAT):
+                    _, _, inner2 = inner[0][1]
+                    if len(inner2) == 1 and inner2[0][0] is _parser.IN:
+                        chars = _collect_in_expandable_chars(inner2[0][1])
+                        if chars:
+                            return sorted(set(chr(c) for c in chars))
+            if opcode is _parser.IN:
+                chars = _collect_in_expandable_chars(value)
+                if chars:
+                    return sorted(set(chr(c) for c in chars))
+
+        # Fallback: collect any literal characters
+        lits = _collect_literal_chars_from_items(core_items)
+        if lits:
+            return ["".join(lits)]
+        return None
+
+    def _collect_literal_chars_from_items(items):
+        """Collect all LITERAL characters from *items*, recursively
+        entering SUBPATTERN/ATOMIC_GROUP.  Skips zero-width assertions."""
+        chars: list[str] = []
+        for opcode, value in items:
+            if opcode is _parser.LITERAL:
+                chars.append(chr(value))
+            elif opcode in (_parser.ASSERT, _parser.ASSERT_NOT, _parser.AT):
+                continue
+            elif opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                inner = value[3] if opcode is _parser.SUBPATTERN else value
+                chars.extend(_collect_literal_chars_from_items(inner))
+        return chars
+
+    def _shorten_branch_literals(node) -> tuple[list[str], bool, bool] | None:
+        """Extract guaranteed literal substrings from a branch *node*
+        after stripping leading and trailing expansible content.
+
+        Returns (literals, leading_shortened, trailing_shortened) or None
+        if no literal core can be found.
+
+        - leading_shortened: True if leading expansible content was stripped.
+        - trailing_shortened: True if trailing expansible content was stripped.
+
+        A "shortened" flag being True means the literal result's position
+        relative to external prefix/suffix is uncertain on that side."""
+        items = list(node)
+        leading_prefix, left_stop = _walk_literal_prefix(items)
+        trailing_suffix, right_stop = _walk_literal_suffix(items)
+
+        # Determine if leading/trailing edges had expansible content.
+        # leading_shortened: True if the literal content does NOT start at
+        #   position 0 — i.e. there was expansible content on the left.
+        # trailing_shortened: True if the literal content does NOT extend
+        #   to the end — i.e. there was expansible content on the right.
+        #
+        # If leading_prefix is empty, the walk stopped immediately at
+        # non-literal content → leading was shortened.
+        # If trailing_suffix is empty, the right walk stopped immediately
+        # at non-literal content → trailing was shortened.
+        #
+        # Exception: if left_stop > right_stop the walks overlapped
+        # (pure literal branch).
+        if left_stop > right_stop:
+            return [leading_prefix], False, False
+        # leading_shortened: True if there was expansible content on the
+        # leading edge that was stripped.  A BRANCH at the leading edge
+        # is NOT "shortened" — it's the literal core (nested alternation).
+        # A MAX_REPEAT with expandable LITERAL-based IN is also NOT
+        # shortened — the chars are the core at a fixed position.
+        leading_shortened = False
+        if leading_prefix == "" and left_stop < len(items):
+            stop_item = items[left_stop]
+            stop_opcode = stop_item[0]
+            if stop_opcode is not _parser.BRANCH:
+                # Check if the stop item has an expandable LITERAL IN
+                # (which becomes the core — not shortened)
+                if _try_extract_in_from_item(stop_item) is not None:
+                    leading_shortened = False
+                else:
+                    # Unwrap to check for BRANCH
+                    inner_check = [stop_item]
+                    while len(inner_check) == 1 and inner_check[0][0] in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                        op, val = inner_check[0]
+                        inner_check = val[3] if op is _parser.SUBPATTERN else val
+                    if not any(op is _parser.BRANCH for op, _ in inner_check):
+                        leading_shortened = True
+        trailing_shortened = False
+        if trailing_suffix == "" and right_stop >= 0:
+            stop_item = items[right_stop]
+            stop_opcode = stop_item[0]
+            if stop_opcode is not _parser.BRANCH:
+                if _try_extract_in_from_item(stop_item) is not None:
+                    trailing_shortened = False
+                else:
+                    inner_check = [stop_item]
+                    while len(inner_check) == 1 and inner_check[0][0] in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
+                        op, val = inner_check[0]
+                        inner_check = val[3] if op is _parser.SUBPATTERN else val
+                    if not any(op is _parser.BRANCH for op, _ in inner_check):
+                        trailing_shortened = True
+
+        # Extract middle items (between where left and right walks stopped)
+        middle = items[left_stop : right_stop + 1]
+
+        # If middle is empty, just return leading+trailing
+        if not middle:
+            result = leading_prefix + trailing_suffix
+            if not result:
+                return None
+            return [result], leading_shortened, trailing_shortened
+
+        # Extract literal cores from the middle
+        inner_lits = _extract_inner_literal_cores(middle)
+        if inner_lits is None:
+            # No core found in middle
+            result = leading_prefix + trailing_suffix
+            if not result:
+                return None
+            return [result], leading_shortened, trailing_shortened
+
+        # Combine leading + each core + trailing
+        # Filter out empty strings from inner_lits
+        effective_inner = [c for c in inner_lits if c]
+        if not effective_inner:
+            result = leading_prefix + trailing_suffix
+            if not result:
+                return None
+            return [result], leading_shortened, trailing_shortened
+
+        results = [leading_prefix + c + trailing_suffix for c in effective_inner]
+        return sorted(set(results)), leading_shortened, trailing_shortened
+
+    def _collect_branch_results_shortened(branches, flags: int):
+        """Like _collect_branch_results but falls back to branch shortening
+        when branches contain expansible content.
+
+        Returns (pure_lits, prefix_lits, suffix_lits, core_lits) where:
+        - pure_lits: combine with BOTH prefix and suffix
+        - prefix_lits: combine with PREFIX only (trailing shortened)
+        - suffix_lits: combine with SUFFIX only (leading shortened)
+        - core_lits: combine with NEITHER (both sides shortened)
+
+        Returns None if no results could be produced at all."""
+        pure: list[str] = []
+        prefix_only: list[str] = []
+        suffix_only: list[str] = []
+        core_only: list[str] = []
+
+        for branch in branches:
+            # Try pure literal first
+            lit = _branch_literal_string(branch)
+            if lit:
+                pure.append(lit)
+                continue
+
+            # Try shortening
+            shortened = _shorten_branch_literals(branch)
+            if shortened is None:
+                # Try expansion as last resort
+                expanded = _expand_branch_to_literals(branch, max_results=max_combinations)
+                if expanded and expanded != [""]:
+                    pure.extend(expanded)
+                else:
+                    # Try lookaround extraction
+                    look_lits = _extract_branch_lookaround_literals(branch, max_results=max_combinations)
+                    if look_lits:
+                        pure.extend(look_lits)
+                    else:
+                        return None  # can't guarantee coverage
+                continue
+
+            lits, leading_short, trailing_short = shortened
+            if not lits:
+                return None
+            if leading_short and trailing_short:
+                core_only.extend(lits)
+            elif leading_short:
+                suffix_only.extend(lits)
+            elif trailing_short:
+                prefix_only.extend(lits)
+            else:
+                pure.extend(lits)
+
+        return (
+            sorted(set(pure)) if pure else [],
+            sorted(set(prefix_only)) if prefix_only else [],
+            sorted(set(suffix_only)) if suffix_only else [],
+            sorted(set(core_only)) if core_only else [],
+        )
+
     def _optional_literal_string(node) -> str | None:
         """Like _branch_literal_string but for the inner content of an
         optional construct.  Concatenates all LITERAL nodes, skipping
@@ -447,6 +880,9 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
         for prefix, branch_lits in _pending_alt_ctx:
             _alt_contexts.append((prefix, branch_lits, suffix))
         _pending_alt_ctx.clear()
+        for prefix, pure_lits, prefix_lits, suffix_lits, core_lits in _pending_shortened_alt_ctx:
+            _shortened_alt_contexts.append((prefix, pure_lits, prefix_lits, suffix_lits, core_lits, suffix))
+        _pending_shortened_alt_ctx.clear()
         for prefix, branch_lits, rep_min, rep_max in _pending_alt_repeat_ctx:
             _alt_repeat_contexts.append((prefix, branch_lits, suffix, rep_min, rep_max))
         _pending_alt_repeat_ctx.clear()
@@ -654,6 +1090,22 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                             _pending_alt_ctx.append((prefix, [*branch_lits, ""]))
                         else:
                             _pending_alt_ctx.append((prefix, branch_lits))
+                elif has_mandatory:
+                    # Try branch shortening when _collect_branch_results returns empty
+                    # due to expansible content (not just empty branches).
+                    # Only use shortening if at least one non-empty branch has
+                    # expansible content that _branch_literal_string can't handle.
+                    needs_shortening = any(len(b) > 0 and _branch_literal_string(b) is None for b in branches)
+                    if needs_shortening:
+                        shortened = _collect_branch_results_shortened(branches, flags)
+                        if shortened is not None:
+                            pure_lits, prefix_lits, suffix_lits, core_lits = shortened
+                            if pure_lits or prefix_lits or suffix_lits or core_lits:
+                                if has_empty_branch:
+                                    pure_lits = sorted(set(pure_lits + [""]))
+                                _pending_shortened_alt_ctx.append(
+                                    (prefix, pure_lits, prefix_lits, suffix_lits, core_lits)
+                                )
                 alternations.append((branches, flags, 1, 1))
 
             elif opcode in (_parser.MAX_REPEAT, _parser.MIN_REPEAT):
@@ -729,6 +1181,14 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
             # Use only the outermost alternation (others are nested inside it)
             outer_branches, outer_flags, _rep_min, _rep_max = alternations[0]
             branch_lits = _collect_branch_results(outer_branches, outer_flags)
+            if not branch_lits:
+                # Try branch shortening for non-expandable, non-pure-literal branches
+                shortened = _collect_branch_results_shortened(outer_branches, outer_flags)
+                if shortened is not None:
+                    pure_lits, prefix_lits, suffix_lits, core_lits = shortened
+                    all_shortened = sorted(set(pure_lits + prefix_lits + suffix_lits + core_lits))
+                    if all_shortened:
+                        branch_lits = all_shortened
             if branch_lits:
                 # Check whether the entire pattern is a repeat wrapping
                 # a pure alternation, e.g. (foo|bar){2}.  In that case
@@ -802,6 +1262,70 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
         else:
             mandatory = prefix + suffix
             _make_group_from_branch_combos(full_combos, mandatory, max_combinations, groups)
+
+    # Phase 2: groups from shortened alternation contexts
+    for prefix, pure_lits, prefix_lits, suffix_lits, core_lits, suffix in _shortened_alt_contexts:
+        # pure_lits: combine with BOTH prefix and suffix
+        # prefix_lits: trailing shortened → combine with PREFIX only
+        # suffix_lits: leading shortened → combine with SUFFIX only
+        # core_lits: both shortened → combine with NEITHER
+        if prefix and suffix:
+            # Generate partial groups for each category
+            if pure_lits:
+                full = [prefix + b + suffix for b in pure_lits]
+                _make_group_from_branch_combos(full, prefix + suffix, max_combinations, groups)
+            if prefix_lits:
+                pfx = [prefix + b for b in prefix_lits]
+                _make_group_from_branch_combos(pfx, prefix, max_combinations, groups)
+            if suffix_lits:
+                sfx = [b + suffix for b in suffix_lits]
+                _make_group_from_branch_combos(sfx, suffix, max_combinations, groups)
+            if core_lits:
+                _make_group_from_branch_combos(core_lits, "", max_combinations, groups)
+            # Combined group: all categories together
+            all_combos: list[str] = []
+            for b in pure_lits:
+                all_combos.append(prefix + b + suffix)
+            for b in prefix_lits:
+                all_combos.append(prefix + b)
+            for b in suffix_lits:
+                all_combos.append(b + suffix)
+            for b in core_lits:
+                all_combos.append(b)
+            _make_group_from_branch_combos(all_combos, prefix + suffix, max_combinations, groups)
+        elif prefix:
+            # Only prefix, no suffix
+            all_combos: list[str] = []
+            for b in pure_lits:
+                all_combos.append(prefix + b)
+            for b in prefix_lits:
+                all_combos.append(prefix + b)
+            for b in suffix_lits:
+                all_combos.append(b)  # attaches to suffix (empty) → just b
+            for b in core_lits:
+                all_combos.append(b)
+            _make_group_from_branch_combos(all_combos, prefix, max_combinations, groups)
+        elif suffix:
+            # Only suffix, no prefix
+            all_combos: list[str] = []
+            for b in pure_lits:
+                all_combos.append(b + suffix)
+            for b in prefix_lits:
+                all_combos.append(b)  # attaches to prefix (empty) → just b
+            for b in suffix_lits:
+                all_combos.append(b + suffix)
+            for b in core_lits:
+                all_combos.append(b)
+            _make_group_from_branch_combos(all_combos, suffix, max_combinations, groups)
+        else:
+            # Neither prefix nor suffix — just the literals themselves
+            all_combos: list[str] = []
+            all_combos.extend(pure_lits)
+            all_combos.extend(prefix_lits)
+            all_combos.extend(suffix_lits)
+            all_combos.extend(core_lits)
+            if all_combos:
+                _make_group_from_branch_combos(all_combos, "", max_combinations, groups)
 
     # Phase 2: groups from alternation-repeat contexts
     for prefix, branch_lits, suffix, rep_min, rep_max in _alt_repeat_contexts:
