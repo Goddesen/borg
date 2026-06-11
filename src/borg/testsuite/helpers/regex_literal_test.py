@@ -1665,6 +1665,35 @@ def test_alternation_shorten_both_sides(pattern, expected, matching):
     _assert_grouped_prefilter(pattern, expected, matching)
 
 
+def test_alternation_shorten_split_core():
+    """When a branch has literal content on BOTH sides of expansible
+    content (e.g. opq.+rst, ijk.*lmn), the leading and trailing literal
+    parts must be produced as SEPARATE prefilter literals — one attaching
+    to the prefix, one to the suffix.  Concatenating them (opqrst) is
+    NOT valid because the expansible middle means they are not guaranteed
+    to appear contiguously."""
+    pattern = r"^foo(abc|.+def|ghi.+|ijk.*lmn|opq.+rst)bar"
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    expected = [["defbar", "fooabcbar", "fooghi", "fooijk", "fooopq", "lmnbar", "rstbar"]]
+    assert result is not None, "Expected non-None for split-core pattern"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, f"Expected {expected_normalized},\ngot      {result_normalized}"
+    _assert_grouped_prefilter(
+        pattern,
+        expected,
+        [
+            "fooabcbar",
+            "fooXYZdefbar",
+            "fooghi123bar",
+            "fooijklmnbar",
+            "fooijkXXXlmnbar",
+            "fooopqrstbar",
+            "fooopqYYYrstbar",
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unparseable patterns — should return None
 # ---------------------------------------------------------------------------
