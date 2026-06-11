@@ -113,10 +113,22 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
 
     # Pending alternation contexts: (prefix, branch_literals)
     _pending_alt_ctx: list[tuple[str, list[str]]] = []
+    # Pending alternation contexts inside a MAX_REPEAT/MIN_REPEAT:
+    # (prefix, branch_literals, repeat_min, repeat_max)
+    _pending_alt_repeat_ctx: list[tuple[str, list[str], int, int]] = []
     # Pending optional contexts: (prefix, optional_literal)
     _pending_opt_ctx: list[tuple[str, str]] = []
     # Resolved alternation contexts: (prefix, branch_literals, suffix)
     _alt_contexts: list[tuple[str, list[str], str]] = []
+    # Resolved alternation-repeat contexts:
+    # (prefix, branch_literals, suffix, repeat_min, repeat_max)
+    _alt_repeat_contexts: list[tuple[str, list[str], str, int, int]] = []
+    # When set, the BRANCH handler stores to _pending_alt_repeat_ctx instead
+    # of _pending_alt_ctx, and includes these repeat parameters.
+    _inside_repeat: tuple[int, int] | None = None
+    # Prefix captured before flushing in a MAX_REPEAT handler, for use by
+    # the inner BRANCH handler to record the alternating context.
+    _repeat_prefix: str = ""
     # Resolved optional contexts: (prefix, optional_literal, suffix)
     _opt_contexts: list[tuple[str, str, str]] = []
     # Lookaround-forced literals extracted from positive lookarounds (ASSERT).
@@ -435,19 +447,22 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
         for prefix, branch_lits in _pending_alt_ctx:
             _alt_contexts.append((prefix, branch_lits, suffix))
         _pending_alt_ctx.clear()
+        for prefix, branch_lits, rep_min, rep_max in _pending_alt_repeat_ctx:
+            _alt_repeat_contexts.append((prefix, branch_lits, suffix, rep_min, rep_max))
+        _pending_alt_repeat_ctx.clear()
         for prefix, opt_lit in _pending_opt_ctx:
             _opt_contexts.append((prefix, opt_lit, suffix))
         _pending_opt_ctx.clear()
 
     def _expand_repeat_combinations(items: list[str], repeat_min: int, repeat_max: int, budget: int) -> list[str]:
         """Generate cross-product combinations of *items* repeated
-        *repeat_min* to *repeat_max* times, capped at *budget*."""
+        *repeat_min* times, capped at *budget*."""
         if not items or repeat_min < 1:
             return []
         # Start with empty string (0 repetitions)
         current: list[str] = [""]
         results: list[str] = []
-        for rep in range(1, repeat_max + 1):
+        for rep in range(1, repeat_min + 1):
             next_set: set[str] = set()
             for prefix in current:
                 for item in items:
@@ -524,6 +539,7 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
 
     def walk(node, flags: int = 0, inside_alt: bool = False, inside_ci: bool = False) -> None:
         nonlocal current, _pending_lookbehind_lits, _lookbehind_body_merged
+        nonlocal _inside_repeat, _pending_alt_repeat_ctx, _repeat_prefix
         for opcode, value in node:
             if opcode is _parser.LITERAL:
                 current.append(chr(value))
@@ -616,7 +632,7 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                 # Phase 2: if there are mandatory literals outside this
                 # alternation, record a pending context so we can later
                 # produce combined prefix + branch + suffix groups.
-                prefix = "".join(current)
+                prefix = _repeat_prefix if _inside_repeat else "".join(current)
                 branch_lits = _collect_branch_results(branches, flags)
                 # For Phase 2, also check for empty branches (e.g. (a|)b).
                 # An empty branch means the alternation may match nothing,
@@ -627,10 +643,17 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                 if has_mandatory and branch_lits:
                     # Include an empty string for empty branches so
                     # combined groups cover both cases.
-                    if has_empty_branch:
-                        _pending_alt_ctx.append((prefix, [*branch_lits, ""]))
+                    if _inside_repeat:
+                        rep_min, rep_max = _inside_repeat
+                        if has_empty_branch:
+                            _pending_alt_repeat_ctx.append((prefix, [*branch_lits, ""], rep_min, rep_max))
+                        else:
+                            _pending_alt_repeat_ctx.append((prefix, branch_lits, rep_min, rep_max))
                     else:
-                        _pending_alt_ctx.append((prefix, branch_lits))
+                        if has_empty_branch:
+                            _pending_alt_ctx.append((prefix, [*branch_lits, ""]))
+                        else:
+                            _pending_alt_ctx.append((prefix, branch_lits))
                 alternations.append((branches, flags, 1, 1))
 
             elif opcode in (_parser.MAX_REPEAT, _parser.MIN_REPEAT):
@@ -666,8 +689,19 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                         _in_alt_repeats.append((prefix_before, in_chars, min_c, max_c))
                         if prefix_before:
                             _consumed_prefixes.add(prefix_before)
+                    # If the inner is a pure alternation, record repeat params
+                    # so Phase 2 can generate cross-products / anchor-pairs.
+                    _inside_repeat = (min_c, max_c)
+                    _repeat_prefix = prefix_before
                     walk(inner, flags, inside_alt=inside_alt, inside_ci=inside_ci)
+                    _repeat_prefix = ""
+                    _inside_repeat = None
+                    # Save and restore pending repeat ctx around flush to
+                    # prevent premature resolution (suffix not yet accumulated).
+                    saved_repeat = _pending_alt_repeat_ctx.copy()
+                    _pending_alt_repeat_ctx.clear()
                     _flush(inside_ci)
+                    _pending_alt_repeat_ctx = saved_repeat
 
     walk(parsed)
     _flush()  # flush any remaining segment / resolve remaining pending contexts
@@ -743,22 +777,15 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
     def _make_group_from_branch_combos(combos: list[str], fallback: str, budget: int, groups_out: list) -> None:
         """Build a prefilter group from *combos*, truncating to *budget*.
 
-        When *combos* exceeds *budget*, truncation may drop the only
-        representative for some branches, breaking the prefilter contract.
-        To prevent that, the mandatory common *fallback* literal (e.g.
-        prefix + suffix) is guaranteed to appear in every regex match and
-        is injected as a safety-net literal.
+        When *combos* exceeds *budget*, the group is skipped entirely —
+        truncation with a fallback prefix/suffix would inject a literal
+        that is a substring of every kept combo, creating suboptimal
+        literals within the group.  Phase 1 mandatory groups already
+        guarantee prefilter coverage for all matches.
         """
-        if not combos:
+        if not combos or len(combos) > budget:
             return
-        if len(combos) <= budget:
-            trimmed = sorted(set(combos), key=lambda s: (len(s), s))[:budget]
-        else:
-            # Reserve room for the fallback literal when truncation occurs.
-            reserve = 1 if fallback and fallback not in combos else 0
-            trimmed = sorted(set(combos), key=lambda s: (len(s), s))[: budget - reserve]
-            if fallback and fallback not in trimmed:
-                trimmed.append(fallback)
+        trimmed = sorted(set(combos), key=lambda s: (len(s), s))[:budget]
         if trimmed:
             groups_out.append(trimmed)
 
@@ -775,6 +802,27 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
         else:
             mandatory = prefix + suffix
             _make_group_from_branch_combos(full_combos, mandatory, max_combinations, groups)
+
+    # Phase 2: groups from alternation-repeat contexts
+    for prefix, branch_lits, suffix, rep_min, rep_max in _alt_repeat_contexts:
+        # Min-level full combos: prefix + branch + suffix
+        min_full = [prefix + b + suffix for b in branch_lits]
+        max_items = len(branch_lits) ** rep_max
+        if rep_max > rep_min and max_items <= max_combinations:
+            # Max-level fits: include both min-full and max-full
+            max_gen = list(branch_lits)
+            for _ in range(rep_min, rep_max):
+                max_gen = [a + b for a in max_gen for b in branch_lits]
+            max_full = [prefix + lit + suffix for lit in max_gen]
+            combined = sorted(set(min_full + max_full))
+            _make_group_from_branch_combos(combined, prefix + suffix, max_combinations, groups)
+        elif rep_max > rep_min:
+            # Max-level exceeds budget: use anchor-pairs
+            anchors = sorted(set([prefix + b for b in branch_lits] + [b + suffix for b in branch_lits]))
+            _make_group_from_branch_combos(anchors, prefix + suffix, max_combinations, groups)
+        else:
+            # rep_max == rep_min: just min_full (plain alternation, no repeat)
+            _make_group_from_branch_combos(min_full, prefix + suffix, max_combinations, groups)
 
     # Phase 2: groups from optional contexts
     for prefix, opt_lit, suffix in _opt_contexts:

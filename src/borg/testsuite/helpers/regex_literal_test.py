@@ -1,6 +1,6 @@
-import re
-
 import pytest
+import re
+from itertools import combinations
 
 from ...helpers.regex_literal import pattern_extract_prefilter_literals
 
@@ -18,11 +18,15 @@ def _assert_prefilter_inclusion(pattern, literals, matching_strings):
     except re.error:
         pytest.skip(f"Pattern {pattern!r} cannot be compiled by stdlib re")
 
+    for lit_short, lit_long in combinations(sorted(literals, key=lambda k: (len(k), k)), 2):
+        assert (
+            lit_short not in lit_long
+        ), f"Suboptimal literals for pattern {pattern!r}, {lit_long} is superfluous together with {lit_short}"
+
     for matching_string in matching_strings:
-        assert compiled.search(matching_string), (
-            # Remove once implementation is finished
-            f"Test string {matching_string!r} does not match pattern {pattern!r} — fix the test data"
-        )
+        assert compiled.search(
+            matching_string
+        ), f"Test string {matching_string!r} does not match pattern {pattern!r} — fix the test data"
         assert any(literal in matching_string for literal in literals), (
             f"String {matching_string!r} matches {pattern!r} but contains none of the "
             f"returned literals {literals!r}"
@@ -692,26 +696,21 @@ def test_expand_branch_to_literals_budget_cap():
 def test_max_combinations_large_budget_over_900():
     """With max_combinations=1000, a pattern producing >900 combos returns
     >900 valid prefilter literals (all within budget)."""
-    # (a|b|c|d|e|f|g|h|i|j){1,3} produces 10+100+1000=1110 combos total.
-    pattern = "(a|b|c|d|e|f|g|h|i|j){1,3}"
+    # 31 two-char branches with {2} → 31² = 961 combos (all at min level).
+    pattern = (
+        "(aa|ab|ac|ad|ae|af|"
+        "ba|bb|bc|bd|be|bf|"
+        "ca|cb|cc|cd|ce|cf|"
+        "da|db|dc|dd|de|df|"
+        "ea|eb|ec|ed|ee|ef|"
+        "fa){2}"
+    )
     result = pattern_extract_prefilter_literals(pattern, max_combinations=1000)
     assert result is not None, "budget=1000 should not return None"
     total = sum(len(g) for g in result)
     assert total > 900, f"expected >900 literals, got {total}"
     assert total <= 1000
-    matching = [
-        "a",
-        "j",
-        "ab",
-        "ji",
-        "abc",
-        "def",
-        "aaa",
-        "jjj",
-        "hij",
-        "abcdefghij",
-        "jjjjjjjjjj",  # longer than max repeat — no match
-    ]
+    matching = ["abef", "faaa", "abcd", "dccd", "aaaa", "abcdefghij"]  # search finds "abcd" in a larger buffer
     _assert_prefilter_inclusion(pattern, result[0], matching)
 
 
@@ -753,18 +752,18 @@ def test_adjacent_character_classes_extract_expandable_chars():
 
 def test_max_combinations_budget_exceeds_total():
     """When max_combinations exceeds total possible combos, all are returned."""
-    # (a|b|c|d|e){1,2} = 5+25=30 combos total
-    pattern = "(a|b|c|d|e){1,2}"
-    result = pattern_extract_prefilter_literals(pattern, max_combinations=100)
+    # 10 two-char branches with {2} → 10² = 100 combos total (all at min level).
+    pattern = "(a0|a1|a2|a3|a4|b0|b1|b2|b3|b4){2}"
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=200)
     assert result is not None
-    assert sum(len(g) for g in result) == 30
-    matching = ["a", "e", "aa", "ee", "abcde", "edcba"]
+    assert sum(len(g) for g in result) == 100
+    matching = ["a0b4", "b4a0", "a0a0", "b4b4", "xa0b4y", "prefix_b4a0_suffix"]
     _assert_prefilter_inclusion(pattern, result[0], matching)
 
     # Exact fit (budget == total) should also return all
-    result2 = pattern_extract_prefilter_literals(pattern, max_combinations=30)
+    result2 = pattern_extract_prefilter_literals(pattern, max_combinations=100)
     assert result2 is not None
-    assert sum(len(g) for g in result2) == 30
+    assert sum(len(g) for g in result2) == 100
 
 
 def test_max_combinations_with_prefix_repeat():
@@ -815,6 +814,34 @@ def test_alternation_mixed_digit_and_pure_literal_truncation():
                 "fooxxx",
             ],
         )
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [
+        (r"(ab|cd){1,2}", ["abab", "abcd", "cdab", "cdcd"]),
+        (r"foo(xy|XY){1,2}bar", ["fooxyxybar", "fooxyXYbar", "fooXYxybar", "fooXYXYbar"]),
+    ],
+)
+def test_potential_suboptimal_literals(pattern, matching):
+    result = pattern_extract_prefilter_literals(pattern)
+    for literals in result:
+        _assert_prefilter_inclusion(pattern, literals, matching)
+
+
+@pytest.mark.parametrize(
+    "pattern, literals",
+    [
+        (r"(ab|cd){1,2}", ["ab", "cd"]),
+        (r"foo(xy|XY){1,2}bar", ["fooxybar", "fooXYbar", "fooxyxybar", "fooxyXYbar", "fooXYxybar", "fooXYXYbar"]),
+        (r"foo(xy|XY){1,5}bar", ["fooxy", "fooXY", "xybar", "XYbar"]),
+    ],
+)
+def test_extracts_optimal_literals(pattern, literals):
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None
+    assert len(result) == 1
+    assert set(result[0]) == set(literals)
 
 
 # ---------------------------------------------------------------------------
