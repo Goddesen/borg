@@ -415,11 +415,12 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
             return True
         if opcode in (_parser.MAX_REPEAT, _parser.MIN_REPEAT):
             min_c, max_c, inner = value
-            # A repeat is strippable if its max is unbounded (>1 repetition
-            # possible) OR if the inner itself is expansible.
-            if max_c != 1:
+            # A repeat is strippable if its min is zero (optional — may
+            # be absent), its max is unbounded (>1 repetition possible),
+            # or if the inner itself is expansible.
+            if min_c == 0 or max_c != 1:
                 return True
-            # max_c == 1: check inner for expansible content
+            # max_c == 1, min_c > 0: check inner for expansible content
             return _contains_strippable(inner)
         if opcode in (_parser.SUBPATTERN, _parser.ATOMIC_GROUP):
             inner = value[3] if opcode is _parser.SUBPATTERN else value
@@ -649,6 +650,40 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
                 chars = _collect_in_expandable_chars(value)
                 if chars:
                     return sorted(set(chr(c) for c in chars))
+
+        # Check for expandable IN at leading/trailing edges with
+        # literal (or empty) content between.  When an expandable IN
+        # sits at the edge, its characters must be expanded and
+        # crossed with the inner literal content — otherwise the IN
+        # characters are silently dropped, producing phantom literals.
+        if len(core_items) >= 2:
+            prefix_in_chars = _try_extract_in_from_item(core_items[0])
+            suffix_in_chars = _try_extract_in_from_item(core_items[-1])
+            if prefix_in_chars or suffix_in_chars:
+                inner = core_items
+                if prefix_in_chars:
+                    inner = inner[1:]
+                if suffix_in_chars:
+                    inner = inner[:-1]
+                inner_lits = _collect_literal_chars_from_items(inner)
+                inner_str = "".join(inner_lits) if inner_lits else ""
+                results: list[str] = []
+                if prefix_in_chars and suffix_in_chars:
+                    prefix_c = [chr(c) for c in prefix_in_chars]
+                    suffix_c = [chr(c) for c in suffix_in_chars]
+                    for pc in prefix_c:
+                        for sc in suffix_c:
+                            results.append(pc + inner_str + sc)
+                elif prefix_in_chars:
+                    prefix_c = [chr(c) for c in prefix_in_chars]
+                    for pc in prefix_c:
+                        results.append(pc + inner_str)
+                elif suffix_in_chars:
+                    suffix_c = [chr(c) for c in suffix_in_chars]
+                    for sc in suffix_c:
+                        results.append(inner_str + sc)
+                if results:
+                    return sorted(set(results))
 
         # Fallback: collect any literal characters
         lits = _collect_literal_chars_from_items(core_items)
@@ -1349,8 +1384,7 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
     for prefix, branch_lits, suffix, rep_min, rep_max in _alt_repeat_contexts:
         # Min-level full combos: prefix + branch + suffix
         min_full = [prefix + b + suffix for b in branch_lits]
-        max_items = len(branch_lits) ** rep_max
-        if rep_max > rep_min and max_items <= max_combinations:
+        if rep_max > rep_min and rep_max != _parser.MAXREPEAT and len(branch_lits) ** rep_max <= max_combinations:
             # Max-level fits: include both min-full and max-full
             max_gen = list(branch_lits)
             for _ in range(rep_min, rep_max):
@@ -1363,8 +1397,21 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
             anchors = sorted(set([prefix + b for b in branch_lits] + [b + suffix for b in branch_lits]))
             _make_group_from_branch_combos(anchors, prefix + suffix, max_combinations, groups)
         else:
-            # rep_max == rep_min: just min_full (plain alternation, no repeat)
-            _make_group_from_branch_combos(min_full, prefix + suffix, max_combinations, groups)
+            # rep_max == rep_min: exact repeat (could be {1} or {n})
+            if rep_min == 1:
+                # Plain alternation, no repeat — single-rep combos are valid
+                _make_group_from_branch_combos(min_full, prefix + suffix, max_combinations, groups)
+            elif len(branch_lits) ** rep_min <= max_combinations:
+                # Cross-product for {n} with n>1 fits within budget
+                combos = list(branch_lits)
+                for _ in range(1, rep_min):
+                    combos = [a + b for a in combos for b in branch_lits]
+                full_combos = [prefix + lit + suffix for lit in combos]
+                _make_group_from_branch_combos(sorted(set(full_combos)), prefix + suffix, max_combinations, groups)
+            else:
+                # Cross-product exceeds budget — use anchor-pairs
+                anchors = sorted(set([prefix + b for b in branch_lits] + [b + suffix for b in branch_lits]))
+                _make_group_from_branch_combos(anchors, prefix + suffix, max_combinations, groups)
 
     # Phase 2: groups from optional contexts
     for prefix, opt_lit, suffix in _opt_contexts:
@@ -1386,6 +1433,20 @@ def pattern_extract_prefilter_literals(pattern: str, *, max_combinations: int = 
         if key not in seen:
             seen.add(key)
             unique.append(g_sorted)
+
+    # Prune subsumed literals within each group: if a shorter literal is
+    # a substring of a longer literal in the same group, the longer one is
+    # superfluous — any match that contains the longer also contains the
+    # shorter, so only the shorter needs to be kept.
+    for g in unique:
+        g_sorted = sorted(g, key=lambda s: (len(s), s))
+        kept: list[str] = []
+        for lit in g_sorted:
+            if any(k in lit for k in kept):
+                # lit is redundant — a shorter kept literal is a substring
+                continue
+            kept.append(lit)
+        g[:] = kept
 
     # Prune subsumed groups: if every literal in group G is a substring
     # of at least one literal in another group H, then G is redundant —

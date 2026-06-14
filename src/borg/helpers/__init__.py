@@ -54,6 +54,7 @@ from .progress import ProgressIndicatorPercent, ProgressIndicatorMessage
 from .time import parse_timestamp, timestamp, safe_timestamp, safe_s, safe_ns, MAX_S, SUPPORT_32BIT_PLATFORMS
 from .time import format_time, format_timedelta, OutputTimestamp, archive_ts_now
 from .yes_no import yes, TRUISH, FALSISH, DEFAULTISH
+from .regex_literal import pattern_extract_prefilter_literals
 
 from .msgpack import is_slow_msgpack, is_supported_msgpack, get_limited_unpacker
 from . import msgpack

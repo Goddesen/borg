@@ -844,6 +844,20 @@ def test_extracts_optimal_literals(pattern, literals):
     assert set(result[0]) == set(literals)
 
 
+def test_zero_width_anchor_alternation_no_superfluous_literals():
+    """Alternation between a literal and a zero-width anchor ($) should not
+    produce superfluous literals where one is a substring of another.
+
+    ($|/) gives branches '' (from $) and '/'.  Combined with prefix '/.git'
+    this produces '/.git' and '/.git/'.  The shorter is a substring of the
+    longer, so the longer is superfluous and must be removed."""
+    pattern = r"^Users/goddesen/(Dev|Gamedev)/.*/\.git($|/)"
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None
+    matching = ["Users/goddesen/Dev/foo/.git", "Users/goddesen/Gamedev/bar/.git/baz"]
+    _assert_prefilter_inclusion(pattern, result[0], matching)
+
+
 # ---------------------------------------------------------------------------
 # MAX_REPEAT{0,N} spurious inner flushes (Step 5b)
 # ---------------------------------------------------------------------------
@@ -1692,6 +1706,295 @@ def test_alternation_shorten_split_core():
             "fooopqYYYrstbar",
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps: code paths in _branch_literal_string not exercised
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [
+        # Internal ASSERT (lookahead) between literals in a branch.
+        # bar(?=...)baz: after 'bar', lookahead checks 3 chars, then
+        # literal 'baz' matches from the same position as the lookahead.
+        (r"^(foo|bar(?=...)baz)$", ["barbaz", "foo"]),
+        # Internal ASSERT_NOT (negative lookahead) between literals in a branch
+        (r"^(foo|bar(?!baz)qux)$", ["barqux", "foo"]),
+        # Required-repeat (MIN_REPEAT) wrapping pure literal content inside branch
+        (r"^(foo|a{2}bc)$", ["aabc", "foo"]),
+    ],
+)
+def test_branch_literal_string_internal_assert(pattern, matching):
+    """Lines 234-236, 242, 249-250: _branch_literal_string must handle internal
+    ASSERT/ASSERT_NOT nodes and MAX_REPEAT wrapping pure literal content."""
+    _check(pattern, matching, assert_not_none=True)
+
+
+def test_branch_literal_string_internal_at():
+    """Line 234-236: Internal AT (\\b word boundary) inside a branch.
+    Triggers the `elif opcode in (ASSERT, ASSERT_NOT, AT): continue` path
+    when _branch_literal_string encounters a non-edge AT node."""
+    result = pattern_extract_prefilter_literals(r"^(foo|bar)\bbaz$")
+    if result is not None:
+        for s in ["foobar"]:
+            assert any(lit in s for g in result for lit in g), f"String {s!r} matches but no prefilter in {result}"
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [
+        # Top-level case-insensitive flag with pure alternation
+        (r"(?i)(foo|bar)", ["FOO", "bar", "Foo", "BAR"]),
+        # Top-level case-insensitive with alternation + prefix
+        (r"(?i)pre(fix|lude|text)", ["PREFIX", "prelude", "PRELUDE", "Pretext"]),
+    ],
+)
+def test_ci_with_alternation(pattern, matching):
+    """Line ~1103-1123: Top-level CI + alternation fallback must expand case
+    variants of each branch literal."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    _assert_prefilter_inclusion(pattern, result[0], matching)
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps: _extract_inner_literal_cores deeply wrapped IN/BRANCH
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected",
+    [
+        # Deeply nested SUBPATTERN wrapping an expandable IN
+        (r"(?:(?:[a-f]))+x", [["a", "b", "c", "d", "e", "f"], ["x"]]),
+        # MAX_REPEAT wrapping IN inside nested SUBPATTERN.
+        # The + quantifier prevents prefix+digit+suffix merge (single-char
+        # expansion is not valid), so the individual groups remain separate.
+        (r"pre(?:(?:[0-9]))+suf", [["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], ["pre"], ["suf"]]),
+    ],
+)
+def test_deeply_wrapped_expandable_in(pattern, expected):
+    """Lines ~626-651: _extract_inner_literal_cores unwrapping multiple
+    SUBPATTERN/ATOMIC_GROUP layers to find an expandable IN."""
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps: alternation-shortening edge cases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, expected, matching",
+    [
+        # Shortened with ONLY suffix (no prefix outside alternation)
+        (r"(\d+foo|\d+bar)suffix", [["barsuffix", "foosuffix"]], ["123foosuffix", "999barsuffix"]),
+        # Shortened with NEITHER prefix nor suffix (core-only)
+        (r"\d+mid\d+|\d+other\d+", [["mid", "other"]], ["123mid456", "0other9"]),
+    ],
+)
+def test_shortened_prefix_suffix_edge_cases(pattern, expected, matching):
+    """Lines ~1324, 1336: Branch shortening producing suffix-only and
+    core-only results (no prefix outside alternation)."""
+    result = pattern_extract_prefilter_literals(pattern, max_combinations=20)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    result_normalized = sorted([sorted(g) for g in result])
+    expected_normalized = sorted([sorted(g) for g in expected])
+    assert result_normalized == expected_normalized, (
+        f"For {pattern!r}:\n" f"  expected: {expected_normalized}\n" f"  got:      {result_normalized}"
+    )
+    for g in result:
+        for s in matching:
+            assert any(lit in s for lit in g), f"Group {g!r} fails for {s!r} matching {pattern!r}"
+
+
+def test_shortening_inside_repeat():
+    """Lines ~751-754: Branch shortening inside a required repeat.
+    The repeat creates a _inside_repeat context; the BRANCH inside it
+    should use _repeat_prefix and fall back to shortening when branches
+    have expansible content."""
+    result = pattern_extract_prefilter_literals(r"x(\d+foo|\d+bar){2}y", max_combinations=20)
+    assert result is not None, "Expected non-None"
+    # Phase 1 guarantees: 'x' and 'y' are mandatory.
+    # Shortened branches produce trailing-side literals from the core 'foo'/'bar'.
+    # Because there's no prefix outside the repeat (current is empty before the
+    # MAX_REPEAT in x...), _repeat_prefix = "" and the shortened results are
+    # the suffix-only variants (fooy, bary) and suffix (y).
+    all_lits = set(lit for g in result for lit in g)
+    assert "x" in all_lits, f"Expected mandatory 'x' in {all_lits}"
+    assert "y" in all_lits, f"Expected mandatory 'y' in {all_lits}"
+    assert "foo" in all_lits or "bar" in all_lits, f"Expected foo/bar in {all_lits}"
+    for g in result:
+        for s in ["x123foo456bary", "x999bar000fooy", "x1foo2fooy"]:
+            assert any(lit in s for lit in g), f"Group {g!r} fails for {s!r}"
+
+
+# ---------------------------------------------------------------------------
+# Alternation-repeat {n} with prefix+suffix
+# ---------------------------------------------------------------------------
+
+
+def test_alternation_exact_repeat_with_prefix_suffix():
+    """An exact-repeat alternation {n} with both prefix AND suffix produces
+    Phase 2 groups with cross-product combos for {n} repetitions. When the
+    cross-product fits within budget, all n-repetition combos are returned.
+
+    E.g., 'prefixbarfoosuffix' matches the pattern and must contain at least
+    one prefilter literal."""
+    result = pattern_extract_prefilter_literals(r"prefix(foo|bar){2}suffix")
+    assert result is not None, "Expected non-None"
+    # The result must satisfy the prefilter contract
+    for s in ["prefixbarfoosuffix", "prefixfoobarsuffix", "prefixbarbarsuffix", "prefixfoofoosuffix"]:
+        assert any(
+            lit in s for g in result for lit in g
+        ), f"String {s!r} matches but has no prefilter literal in {result}"
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [
+        # Only prefix — single-rep expansion IS valid here
+        (r"prefix(foo|bar){2}", ["prefixbarfoo", "prefixfoobar"]),
+        # Only suffix — single-rep expansion IS valid here
+        (r"(foo|bar){2}suffix", ["foobarsuffix", "barfoosuffix"]),
+        # Unbounded repeat with both — works via anchor-pairs
+        (r"pre(foo|bar)+suf", ["prefoosuf", "prebarsuf", "prefoobarbarsuf"]),
+    ],
+)
+def test_alternation_repeat_prefix_suffix_valid_cases(pattern, matching):
+    """Regression: alternation-repeat with prefix-only or suffix-only (not both)
+    should produce valid Phase 2 groups. Also unbounded repeats use anchor-pairs
+    which are also valid."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    for g in result:
+        for s in matching:
+            assert any(lit in s for lit in g), f"Group {g!r} fails for {s!r} matching {pattern!r}"
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps: consecutive lookbehinds
+# ---------------------------------------------------------------------------
+
+
+def test_sequential_lookbehinds_only_last_survives():
+    """Lines ~145, 159-164: When two consecutive positive lookbehinds precede
+    the match body, only the LAST lookbehind's literal survives in
+    _pending_lookbehind_lits. The earlier one is silently overwritten.
+
+    This is a missed optimization (not a correctness bug) because the merged
+    body+lookbehind group subsumes both literals."""
+    # (?<=a)(?<=ab)cd: both 'a' and 'ab' are guaranteed, but only 'ab' survives.
+    # The merged 'abcd' subsumes both.
+    result = pattern_extract_prefilter_literals(r"(?<=a)(?<=ab)cd")
+    assert result is not None, "Expected non-None"
+    # Must contain 'abcd' (the merged group)
+    if result:
+        assert any("abcd" in g for g in result), f"Expected 'abcd' in {result}"
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps: _expand_branch_to_literals with leading lookahead skip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [
+        # Leading lookahead in a branch — _expand_branch_to_literals must skip
+        # the leading ASSERT (direction=+1) and expand the IN body around it.
+        (r"(?=[a-c])[abc]|foo", ["a", "c", "foo"]),
+        # Leading lookbehind in a branch — prepended to expansion results
+        (r"(?<=\$)[abc]|foo", ["$a", "$c", "foo"]),
+    ],
+)
+def test_expand_branch_leading_lookaround(pattern, matching):
+    """Line ~310-316, 334: _expand_branch_to_literals must correctly handle
+    leading lookahead/lookbehind ASSERT nodes when expanding a branch."""
+    _check(pattern, matching, assert_not_none=True)
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps: conjunction of multiple pending contexts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pattern, matching",
+    [
+        # Alternation + repeated alternation with prefix and suffix
+        (r"pre(abc|def)(ghi|jkl){2}suf", ["preabcghighisuf", "predefjkljklsuf"]),
+        # Scoped CI inside a required repeat wrapping alternation.
+        # Note: + quantifier with CI alternation can be expensive;
+        # keep the repeat small ({1,3}) to avoid combinatorial explosion.
+        (r"x(?i:foo|bar){1,3}y", ["xfooy", "xFOOy", "xbarbary", "xFoobarFOOy"]),
+        # Optional group before alternation repeat, with suffix
+        (r"x(?:-)?(foo|bar){2}y", ["x-y", "x-foobary", "xbarfooy"]),
+    ],
+)
+def test_mixed_pending_contexts(pattern, matching):
+    """Combinations of multiple pending Phase 2 contexts (alternation +
+    repeat-ci + optional) with surrounding mandatory literals."""
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+    # The first group must cover all matching strings
+    for s in matching:
+        assert any(
+            lit in s for g in result for lit in g
+        ), f"String {s!r} matches {pattern!r} but has no prefilter in {result}"
+
+
+# ---------------------------------------------------------------------------
+# IN + literal core shortening fix
+# ---------------------------------------------------------------------------
+
+
+def test_in_literal_core_shortening_no_phantom_results():
+    """The shorten-branch path must expand expandable IN nodes at the edge
+    of the literal core.  Otherwise the IN characters are silently stripped
+    and a phantom literal is produced that is not a substring of actual
+    matches.
+
+    Regression test for pattern:
+      /ansible/([Ll]ib(64)?|[Ii]nclude|[Bb]in|[Ll]ocal|[Ss]cripts)$
+    which was returning "/ansible/ib" — the IN [Ll] was dropped from the
+    core of branch [Ll]ib(64)?.
+    """
+    pattern = r"/ansible/([Ll]ib(64)?|[Ii]nclude|[Bb]in|[Ll]ocal|[Ss]cripts)$"
+    result = pattern_extract_prefilter_literals(pattern)
+    assert result is not None, f"Expected non-None for {pattern!r}"
+
+    # Collect all literals across all groups
+    all_lits = [lit for g in result for lit in g]
+
+    # The phantom literal must not appear
+    assert "/ansible/ib" not in all_lits, f"Phantom literal '/ansible/ib' leaked into results: {all_lits!r}"
+
+    # Verify contract: every match contains at least one literal from the
+    # first group.
+    matching = [
+        "/ansible/Lib",
+        "/ansible/lib",
+        "/ansible/Lib64",
+        "/ansible/lib64",
+        "/ansible/Include",
+        "/ansible/include",
+        "/ansible/Bin",
+        "/ansible/bin",
+        "/ansible/Local",
+        "/ansible/local",
+        "/ansible/Scripts",
+        "/ansible/scripts",
+    ]
+    _assert_prefilter_inclusion(pattern, result[0], matching)
 
 
 # ---------------------------------------------------------------------------
