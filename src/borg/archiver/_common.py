@@ -12,7 +12,7 @@ from ..helpers import Highlander, octal_int
 from ..helpers.argparsing import SUPPRESS, PositiveInt
 from ..helpers.nanorst import rst_to_terminal
 from ..manifest import Manifest, AI_HUMAN_SORT_KEYS
-from ..patterns import PatternMatcher
+from ..patterns import setup_pattern_matcher
 from ..remote import RemoteRepository
 from ..repository import Repository
 from ..repoobj import RepoObj
@@ -607,10 +607,9 @@ def define_common_options(add_common_option):
 
 
 def build_matcher(inclexcl_patterns, include_paths, pattern_roots=()):
-    matcher = PatternMatcher()
-    matcher.add_inclexcl(inclexcl_patterns)
-    paths = list(pattern_roots) + list(include_paths)
-    matcher.add_includepaths(paths)
+    with setup_pattern_matcher(roots=list(pattern_roots)) as matcher:
+        matcher.add_inclexcl(inclexcl_patterns)
+        matcher.add_includepaths(list(pattern_roots) + list(include_paths))
     return matcher
 
 

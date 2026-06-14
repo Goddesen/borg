@@ -31,7 +31,7 @@ from ..helpers import MakePathSafeAction
 from ..helpers import Error, CommandError, BackupWarning, FileChangedWarning
 from ..helpers.argparsing import ArgumentParser
 from ..manifest import Manifest
-from ..patterns import PatternMatcher
+from ..patterns import setup_pattern_matcher
 from ..platform import is_win32
 
 from ..logger import create_logger
@@ -44,8 +44,8 @@ class CreateMixIn:
     def do_create(self, args, repository, manifest):
         """Creates a new archive."""
         key = manifest.key
-        matcher = PatternMatcher(fallback=True)
-        matcher.add_inclexcl(args.patterns)
+        with setup_pattern_matcher(fallback=True, roots=args.pattern_roots) as matcher:
+            matcher.add_inclexcl(args.patterns)
 
         def create_inner(archive, cache, fso):
             # Add cache dir to inode_skip list
@@ -452,7 +452,8 @@ class CreateMixIn:
         status = None
         try:
             recurse_excluded_dir = False
-            if matcher.match(path):
+            include, recurse_dir = matcher.match(path)
+            if include:
                 with backup_io("stat"):
                     st = os_stat(path=path, parent_fd=parent_fd, name=name, follow_symlinks=False)
             else:
@@ -461,7 +462,7 @@ class CreateMixIn:
                 # we only need to continue if we shall recurse into an excluded directory.
                 # if we shall not recurse, then do not even touch (stat()) the item, it
                 # could trigger an error, e.g. if access is forbidden, see #3209.
-                if not matcher.recurse_dir:
+                if not recurse_dir:
                     return
                 recurse_excluded_dir = True
                 with backup_io("stat"):

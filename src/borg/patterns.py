@@ -1,14 +1,30 @@
 import fnmatch
+import time
+import hashlib
 import posixpath
 import re
 import sys
+import platform
 import unicodedata
 import warnings
+from daachorse import DoubleArrayAhoCorasick, CharwiseDoubleArrayAhoCorasick
 from collections import namedtuple
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
+from operator import itemgetter
+from functools import cache
+from itertools import product
 
-from .helpers import clean_lines, shellpattern
+_ITEMGETTER_2 = itemgetter(2)
+
+
+if sys.version_info >= (3, 14):
+    from compression import zstd
+else:
+    from backports import zstd
+
+from .helpers import clean_lines, shellpattern, pattern_extract_prefilter_literals
 from .helpers.argparsing import Action, ArgumentTypeError
 from .helpers.errors import Error
 
@@ -77,7 +93,9 @@ class PatternMatcher:
 
     """
 
-    def __init__(self, fallback=None):
+    def __init__(self, roots, fallback=None):
+        self._roots = [root.rstrip("/") + "/" for root in roots]
+    # def __init__(self, fallback=None):
         self._items = []
 
         # Value to return from match function when none of the patterns match.
@@ -85,41 +103,261 @@ class PatternMatcher:
 
         # optimizations
         self._path_full_patterns = {}  # full path -> return value
+        self._path_full_patterns__get = self._path_full_patterns.get
 
         # indicates whether the last match() call ended on a pattern for which
         # we should recurse into any matching folder.  Will be set to True or
         # False when calling match().
-        self.recurse_dir = None
+        # self.recurse_dir = None
 
         # Whether to recurse into directories when no match is found.
         # This must be True so that include patterns inside excluded directories
         # work correctly (e.g. "+ /excluded_dir/important" inside "- /excluded_dir").
-        self.recurse_dir_default = True
+        # self.recurse_dir_default = True
 
         self.include_patterns = []
+
+        # self._prefilter_mapping = []
+        # self._prefilter_literals = []
+        # self._always_recheck_patterns = []
+        # self._automaton = None
+        self._match_pattern = None
+        self._default_match = None
 
     def empty(self):
         return not len(self._items) and not len(self._path_full_patterns)
 
-    def _add(self, pattern, cmd):
+    def _add(self, patterns, cmds):
         """*cmd* is an IECommand value."""
-        if isinstance(pattern, PathFullPattern):
-            key = pattern.pattern  # full, normalized path
-            self._path_full_patterns[key] = cmd
+        for pattern, cmd in zip(patterns, cmds):
+            if isinstance(pattern, PathFullPattern):
+                self._path_full_patterns[pattern.pattern] = pattern.match_obj
+            else:
+                self._items.append(pattern)
+        # self._automaton = None  # invalidate cached automaton
+        # self._match_pattern = None
+
+    PATTERN_AUTOMATON_MAGIC = b"BORG-PATTERNS-DB"
+    PATTERN_AUTOMATON_VERSION = b"1"
+
+    def _finalize_matcher(self):
+        """Compile or load cached hyperscan database for the current set of patterns."""
+        if not self._items:
+            self._match_pattern = lambda _path: None
+            return
+
+        automaton = None
+        if True:
+            t0 = time.time_ns()
+            items_hash = (
+                hashlib.sha256(
+                    self.PATTERN_AUTOMATON_MAGIC
+                    + b"\0"
+                    + self.PATTERN_AUTOMATON_VERSION
+                    + b"\0"
+                    + (
+                        platform.processor()
+                        + "\0"
+                        + platform.system()
+                        + "\0"
+                        + repr(self._roots)
+                        + "\0"
+                        + repr([(p.regex_pattern) for p in self._items])
+                    ).encode()
+                )
+                .hexdigest()
+                .encode()
+            )
+
+            cache_automaton_path = Path("patterns.db")
+
+            try:
+                with open(cache_automaton_path, "rb") as f:
+                    cache_content = f.read()
+                    # print(repr(cache_content))
+                    if len(cache_content) <= (
+                        len(self.PATTERN_AUTOMATON_MAGIC)
+                        + len(self.PATTERN_AUTOMATON_VERSION)
+                        + len(items_hash)
+                        + len(DoubleArrayAhoCorasick.__name__)
+                        + 4
+                    ):
+                        # print("abc")
+                        raise RuntimeError("abc")
+
+                    # magic, version, hash, cached_automaton_type, compressed_content = cache_content.split(b"\0", 4)
+                    magic, version, hash, cached_automaton_type, always_recheck_indexes, automaton_content = cache_content.split(b"\0", 5)
+                    # print(f"{self.PATTERN_AUTOMATON_MAGIC} {'==' if self.PATTERN_AUTOMATON_MAGIC == magic else '!='} {magic}")
+                    # print(f"{self.PATTERN_AUTOMATON_VERSION} {'==' if self.PATTERN_AUTOMATON_VERSION == version else '!='} {version}")
+                    # print(f"{items_hash} {'==' if items_hash == hash else '!='} {hash}")
+                    if (
+                        magic != self.PATTERN_AUTOMATON_MAGIC
+                        or version != self.PATTERN_AUTOMATON_VERSION
+                        or hash != items_hash
+                    ):
+                        # print("def")
+                        raise RuntimeError("def")
+
+                    # print(f"{cached_automaton_type} {'==' if cached_automaton_type != DoubleArrayAhoCorasick.__name__.encode() else '!='} {DoubleArrayAhoCorasick.__name__.encode()}")
+                    if cached_automaton_type != DoubleArrayAhoCorasick.__name__.encode():
+                        # print("ghi")
+                        raise RuntimeError("ghi")
+
+                    print(f"Reusing patterns automaton={hash}")
+
+                    # always_recheck_indexes, automaton_content = zstd.decompress(compressed_content).split(b"\0", 1)
+
+                    always_recheck_patterns = [
+                        (None, None, int(istr)) for istr in always_recheck_indexes.split(b",") if istr
+                    ]
+                    automaton = DoubleArrayAhoCorasick.deserialize(automaton_content)
+
+                    print(f"Pattern reuse finished after {(time.time_ns() - t0) / 1000000000:02f}s")
+            except (FileNotFoundError, RuntimeError):
+                print(f"Compiling new patterns automaton={items_hash}")
+
+        if not automaton:
+            print("Compiling new patterns")
+
+            t0 = time.time_ns()
+
+            prefilter_patterns = []
+            always_recheck_patterns = []
+            for i, pattern in enumerate(self._items):
+                prefilter_candidates = pattern_extract_prefilter_literals(pattern.regex_pattern)
+                if prefilter_candidates is None:
+                    print(f"No prefilter candidates for {pattern.regex_pattern!r}")
+                    always_recheck_patterns.append((None, None, i))
+                    continue
+
+                # print(prefilter_candidates)
+                if len(prefilter_candidates) > 1:
+                    matches_any_root = []
+                    matches_no_root = []
+                    for candidate in prefilter_candidates:
+                        matches = False
+                        for lit, root in product(candidate, self._roots):
+                            if lit in root:
+                                matches = True
+                                break
+                        if matches:
+                            matches_any_root.append(candidate)
+                        else:
+                            matches_no_root.append(candidate)
+                    if matches_any_root and matches_no_root:
+                        print(
+                            f"{matches_any_root} has root matches, so keeping only prefilter candidates {matches_no_root}"
+                        )
+                        prefilter_candidates = matches_no_root
+
+                prefilter_literals = max(prefilter_candidates, key=lambda literals: sum(len(lit) for lit in literals))
+
+                # print(prefilter_candidates)
+                # print(prefilter_literals)
+                # sys.exit(1)
+                prefilter_patterns.extend([(literal.encode(), i) for literal in prefilter_literals])
+
+            # print(prefilter_patterns)
+            automaton = DoubleArrayAhoCorasick.build_with_values(prefilter_patterns)
+
+            print(f"Pattern compile finished after {(time.time_ns() - t0) / 1000000000:02f}s")
+            # print(self._always_recheck_patterns)
+
+            if True:
+                # Cache compiled database along with prefilter status
+                with open(cache_automaton_path, "wb") as f:
+                    f.write(
+                        b"\0".join([
+                            self.PATTERN_AUTOMATON_MAGIC,
+                            self.PATTERN_AUTOMATON_VERSION,
+                            items_hash,
+                            automaton.__class__.__name__.encode(),
+                            b",".join(str(idx).encode() for _, _, idx in always_recheck_patterns),
+                            automaton.serialize()
+                        ])
+                        # + zstd.compress(
+                        #     b",".join(str(idx).encode() for _, _, idx in always_recheck_patterns)
+                        #     + b"\0"
+                        #     + automaton.serialize(),
+                        #     level=5,
+                        # )
+                    )
+
+        items__getitem = self._items.__getitem__
+        automaton__find_overlapping = automaton.find_overlapping
+        if always_recheck_patterns:
+
+            def match_pattern(path):
+                nonlocal items__getitem, automaton__find_overlapping, always_recheck_patterns
+
+                automaton_matches = automaton__find_overlapping(path.encode())
+                if automaton_matches:
+                    potential_matches = always_recheck_patterns + automaton_matches
+                else:
+                    potential_matches = always_recheck_patterns
+
+                if len(potential_matches) == 1:
+                    match_start, match_end, match_idx = potential_matches[0]
+                    item = items__getitem(match_idx)
+                    if item.recheck(path, match_start, match_end):
+                        return item.match_obj
+
+                else:
+                    last_seen_idx = None
+                    for match_start, match_end, match_idx in sorted(potential_matches, key=_ITEMGETTER_2):
+                        if last_seen_idx == match_idx:
+                            continue
+                        last_seen_idx = match_idx
+
+                        item = items__getitem(match_idx)
+                        if item.recheck(path, match_start, match_end):
+                            return item.match_obj
+
+                return None
+
         else:
-            self._items.append((pattern, cmd))
+
+            def match_pattern(path):
+                nonlocal automaton__find_overlapping
+
+                potential_matches = automaton__find_overlapping(path.encode())
+                if not potential_matches:
+                    return None
+
+                nonlocal items__getitem, always_recheck_patterns
+
+                if len(potential_matches) == 1:
+                    match_start, match_end, match_idx = potential_matches[0]
+                    item = items__getitem(match_idx)
+                    if item.recheck(path, match_start, match_end):
+                        return item.match_obj
+
+                else:
+                    last_seen_idx = None
+                    for match_start, match_end, match_idx in sorted(potential_matches, key=_ITEMGETTER_2):
+                        if last_seen_idx == match_idx:
+                            continue
+                        last_seen_idx = match_idx
+
+                        item = items__getitem(match_idx)
+                        if item.recheck(path, match_start, match_end):
+                            return item.match_obj
+
+                return None
+
+        self._match_pattern = match_pattern
+        self._default_match = resolve_match_object(include=self.fallback, recurse=True)
 
     def add(self, patterns, cmd):
         """Add list of patterns to internal list. *cmd* indicates whether the
         pattern is an include/exclude pattern, and whether recursion should be
         done on excluded folders.
         """
-        for pattern in patterns:
-            self._add(pattern, cmd)
+        self._add(patterns, [cmd for _ in patterns])
 
     def add_includepaths(self, include_paths):
         """Used to add inclusion-paths from args.paths (from the command line)."""
-        include_patterns = [parse_pattern(p, PathPrefixPattern) for p in include_paths]
+        include_patterns = [parse_pattern(p, include=True, fallback=PathPrefixPattern) for p in include_paths]
         self.add(include_patterns, IECommand.Include)
         self.fallback = not include_patterns
         self.include_patterns = include_patterns
@@ -128,39 +366,38 @@ class PatternMatcher:
         """Note that this only returns patterns added via *add_includepaths*, and it
         won't return PathFullPattern patterns, as we do not maintain match_count for them.
         """
-        return [p for p in self.include_patterns if p.match_count == 0 and not isinstance(p, PathFullPattern)]
+        # return [p for p in self.include_patterns if p.match_count == 0 and not isinstance(p, PathFullPattern)]
+        return []
 
     def add_inclexcl(self, patterns):
         """Add list of patterns (of type CmdTuple) to internal list."""
-        for pattern, cmd in patterns:
-            self._add(pattern, cmd)
+        patterns, cmds = zip(*patterns)
+        self._add(patterns, cmds)
 
     def match(self, path):
-        """Return True or False depending on whether *path* is matched.
-
-        If no match is found among the patterns in this matcher, then the value
-        in self.fallback is returned (defaults to None).
-
+        """
+        Return a Match object with information about how to process the
+        given path. The Match object will be that of the first pattern to match
+        the path, or a fallback Match if no pattern matched.
         """
         path = normalize_path(path).lstrip("/")
-        # do a fast lookup for full path matches (note: we do not count such matches):
-        non_existent = object()
-        value = self._path_full_patterns.get(path, non_existent)
 
-        if value is not non_existent:
-            # we have a full path match!
-            self.recurse_dir = command_recurses_dir(value)
-            return value.is_include
+        return self._path_full_patterns__get(path, None) or self._match_pattern(path) or self._default_match
 
-        # this is the slow way, if we have many patterns in self._items:
-        for pattern, cmd in self._items:
-            if pattern.match(path, normalize=False):
-                self.recurse_dir = pattern.recurse_dir
-                return cmd.is_include
 
-        # by default we will recurse if there is no match
-        self.recurse_dir = self.recurse_dir_default
-        return self.fallback
+@contextmanager
+def setup_pattern_matcher(fallback=None, roots=None):
+    """Context manager for pattern matching with hyperscan database caching.
+
+    Usage:
+        with setup_pattern_matcher(fallback=True) as matcher:
+            matcher.add_inclexcl(patterns)
+            matcher.add_includepaths(paths)
+        # matcher.match(...) can be called after the with block
+    """
+    matcher = PatternMatcher(fallback=fallback, roots=roots)
+    yield matcher
+    matcher._finalize_matcher()
 
 
 def normalize_path(path):
@@ -170,17 +407,26 @@ def normalize_path(path):
     return unicodedata.normalize("NFD", path) if sys.platform == "darwin" else path
 
 
+pattern_id_counter = 0
+
+
 class PatternBase:
     """Shared logic for inclusion/exclusion patterns."""
 
     PREFIX: str = None
 
-    def __init__(self, pattern, recurse_dir=False):
+    def __init__(self, pattern, include, recurse_dir=False):
+        global pattern_id_counter
+
         self.pattern_orig = pattern
-        self.match_count = 0
+        # self.match_count = 0
+
+        self.id = pattern_id_counter
+        pattern_id_counter += 1
+
         pattern = normalize_path(pattern)
         self._prepare(pattern)
-        self.recurse_dir = recurse_dir
+        self.match_obj = resolve_match_object(include=include, recurse=recurse_dir)
 
     def match(self, path, normalize=True):
         """Return a boolean indicating whether *path* is matched by this pattern.
@@ -188,12 +434,16 @@ class PatternBase:
         If normalize is True (default), the path will get normalized using normalize_path(),
         otherwise it is assumed that it already is normalized using that function.
         """
+        # print(f"Slow-matching {self.regex_pattern} against '{path}'")
         if normalize:
             path = normalize_path(path)
-        matches = self._match(path)
-        if matches:
-            self.match_count += 1
+        matches = self.regex.search(path) is not None
+        # if matches:
+        #     self.match_count += 1
         return matches
+
+    def recheck(self, path, match_start, match_end):
+        return self._recheck(path, match_start, match_end)
 
     def __repr__(self):
         return f"{type(self)}({self.pattern})"
@@ -205,7 +455,7 @@ class PatternBase:
         "Should set the value of self.pattern"
         raise NotImplementedError
 
-    def _match(self, path):
+    def _recheck(self, path, match_start, match_end):
         raise NotImplementedError
 
 
@@ -216,9 +466,10 @@ class PathFullPattern(PatternBase):
 
     def _prepare(self, pattern):
         self.pattern = posixpath.normpath(pattern).lstrip("/")  # / at beginning is removed
+        self.regex_pattern = r"\A" + re.escape(self.pattern) + r"\Z"
 
-    def _match(self, path):
-        return path == self.pattern
+    def _recheck(self, path, match_start, match_end):
+        return match_start == 0 and match_end == len(path)
 
 
 # For PathPrefixPattern, FnmatchPattern and ShellPattern, we require that the pattern either match the whole path
@@ -237,9 +488,10 @@ class PathPrefixPattern(PatternBase):
 
     def _prepare(self, pattern):
         self.pattern = (posixpath.normpath(pattern).rstrip("/") + "/").lstrip("/")  # / at beginning is removed
+        self.regex_pattern = r"\A" + re.escape(self.pattern)
 
-    def _match(self, path):
-        return (path + "/").startswith(self.pattern)
+    def _recheck(self, _path, match_start, _match_end):
+        return match_start == 0
 
 
 class FnmatchPattern(PatternBase):
@@ -259,10 +511,11 @@ class FnmatchPattern(PatternBase):
 
         # fnmatch and re.match both cache compiled regular expressions.
         # Nevertheless, this is about 10 times faster.
-        self.regex = re.compile(fnmatch.translate(self.pattern))
+        self.regex_pattern = fnmatch.translate(self.pattern)
+        self.regex = re.compile(self.regex_pattern)
 
-    def _match(self, path):
-        return self.regex.match(path + "/") is not None
+    def _recheck(self, path, match_start, match_end):
+        return self.regex.search(path) is not None
 
 
 class ShellPattern(PatternBase):
@@ -274,15 +527,24 @@ class ShellPattern(PatternBase):
 
     def _prepare(self, pattern):
         if pattern.endswith("/"):
-            pattern = posixpath.normpath(pattern).rstrip("/") + "/**/*/"
+            pattern = posixpath.normpath(pattern).rstrip("/") + "?"
+            match_end = r"\Z"
         else:
-            pattern = posixpath.normpath(pattern) + "/**/*"
+            pattern = posixpath.normpath(pattern) + r"/"
+            match_end = ""
 
         self.pattern = pattern.lstrip("/")  # / at beginning is removed
-        self.regex = re.compile(shellpattern.translate(self.pattern))
+        spattern = shellpattern.translate(self.pattern, match_end=match_end)
+        self.regex_pattern = rf"{spattern[:5]}\A{spattern[5:]}"
+        # print(self.regex_pattern)
+        # sys.exit(1)
+        if self.regex_pattern.endswith("/"):
+            self.regex_pattern = self.regex_pattern[:-1] + r"\Z"
+        # print(self.regex_pattern)
+        self.regex = re.compile(self.regex_pattern)
 
-    def _match(self, path):
-        return self.regex.match(path + "/") is not None
+    def _recheck(self, path, match_start, match_end):
+        return self.regex.search(path) is not None
 
 
 class RegexPattern(PatternBase):
@@ -292,9 +554,10 @@ class RegexPattern(PatternBase):
 
     def _prepare(self, pattern):
         self.pattern = pattern  # / at beginning is NOT removed
-        self.regex = re.compile(pattern)
+        self.regex_pattern = pattern
+        self.regex = re.compile(self.regex_pattern)
 
-    def _match(self, path):
+    def _recheck(self, path, match_start, match_end):
         return self.regex.search(path) is not None
 
 
@@ -303,6 +566,12 @@ _PATTERN_CLASSES = {FnmatchPattern, PathFullPattern, PathPrefixPattern, RegexPat
 _PATTERN_CLASS_BY_PREFIX = {i.PREFIX: i for i in _PATTERN_CLASSES}
 
 CmdTuple = namedtuple("CmdTuple", "val cmd")
+Match = namedtuple("Match", ["include", "recurse"])
+
+
+@cache
+def resolve_match_object(include, recurse):
+    return Match(include, recurse)
 
 
 class IECommand(Enum):
@@ -334,19 +603,19 @@ def get_pattern_class(prefix):
         raise ValueError(f"Unknown pattern style: {prefix}") from None
 
 
-def parse_pattern(pattern, fallback=FnmatchPattern, recurse_dir=True):
+def parse_pattern(pattern, include, fallback=FnmatchPattern, recurse_dir=True):
     """Read pattern from string and return an instance of the appropriate implementation class."""
     if len(pattern) > 2 and pattern[2] == ":" and pattern[:2].isalnum():
         (style, pattern) = (pattern[:2], pattern[3:])
         cls = get_pattern_class(style)
     else:
         cls = fallback
-    return cls(pattern, recurse_dir)
+    return cls(pattern, include, recurse_dir)
 
 
 def parse_exclude_pattern(pattern_str, fallback=FnmatchPattern):
     """Read pattern from string and return an instance of the appropriate implementation class."""
-    epattern_obj = parse_pattern(pattern_str, fallback, recurse_dir=False)
+    epattern_obj = parse_pattern(pattern_str, include=False, fallback=fallback, recurse_dir=False)
     return CmdTuple(epattern_obj, IECommand.ExcludeNoRecurse)
 
 
@@ -393,7 +662,7 @@ def parse_inclexcl_command(cmd_line_str, fallback=ShellPattern):
     else:
         # determine recurse_dir based on command type
         recurse_dir = command_recurses_dir(cmd)
-        val = parse_pattern(remainder_str, fallback, recurse_dir)
+        val = parse_pattern(remainder_str, cmd.is_include, fallback, recurse_dir)
 
     return CmdTuple(val, cmd)
 
