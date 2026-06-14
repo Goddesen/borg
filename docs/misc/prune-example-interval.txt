@@ -1,10 +1,15 @@
 borg prune visualized (count and interval mixed)
 ================================================================================
 
+Scenario: You use borg to perform daily backups. As backups age, the day-to-day
+changes become less important, so to save storage space you want older archives
+to "thin out" over time while retaining most recent archives. Your backup
+script runs `borg create`, immediately followed by `borg prune`.
+
 Assume today is 2026-06-04 and you always start your backups at 16:00. You have
 been creating backup archives starting at 16:00 on most days going back to late
-2025. Today, `create` took a little longer than usual. It's 16:12 now and you
-run `prune`.
+2025. Today, `borg create` took a little longer than usual. It's 16:12 now and
+you run `borg prune`.
 
 You want Borg to keep one archive per day for one week, four weekly archives,
 one archive per month for five months, and two yearly backups. For that, you
@@ -92,16 +97,15 @@ List view
 Notes
 -----
 
-The current day's archive is always kept, because `create` ran at or after the
-date given with `--since`. For `prune`, it's as if this archive doesn't exist
-(yet).
+The current day's archive is always kept, because `create` ran after the date
+given with `--since`. For `prune`, it's as if this archive doesn't exist (yet).
 
 2026-06-03 was skipped, so no archive can be kept with `--keep-daily` for that
 day. Other than with a *count*-based policy, no compensation is made for an
 *interval* like `--keep-daily 1w`, so the rule simply keeps one archive fewer.
 
 2026-05-28 16:00 is exactly one week before `--since`. Since `create` always
-runs at or after 16:00, the archive created on 2026-05-28 is kept, too. Without
+runs after 16:00, the archive created on 2026-05-28 is kept, too. Without
 `--since`, Borg would cut off at 2026-05-28 16:12 instead, which would likely
 mean that the archive created on 2026-05-28 would be pruned. `--since` ensures
 that 2026-05-28 is consistently kept. If you want it consistently pruned, try a
